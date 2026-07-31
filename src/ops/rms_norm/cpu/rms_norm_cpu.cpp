@@ -65,7 +65,14 @@ void rms_norm_(T* out, const T* in, const T* weight, size_t M, size_t D, float e
         for (size_t i = 0; i < D; ++i) {
             float x = to_f32(in_row[i]); 
             float w = to_f32(weight[i]);
-            float y = x * inv_rms * w;
+            float normalized = x * inv_rms;
+            if constexpr (std::is_same_v<T, llaisys::bf16_t> ||
+                          std::is_same_v<T, llaisys::fp16_t>) {
+                // Qwen2/PyTorch casts the normalized activation back to the
+                // input dtype before applying the learned scale.
+                normalized = to_f32(from_f32<T>(normalized));
+            }
+            float y = normalized * w;
             out_row[i] = from_f32<T>(y);
         }
     }

@@ -233,11 +233,12 @@ def test_rms_norm(dtype_name):
             llaisys.Ops.rms_norm(
                 output, make_tensor(inp), make_tensor(weight), eps
             )
-            expected = (
-                inp.float()
-                * torch.rsqrt(inp.float().pow(2).mean(-1, keepdim=True) + eps)
-                * weight.float()
-            ).to(dtype)
+            normalized = inp.float() * torch.rsqrt(
+                inp.float().pow(2).mean(-1, keepdim=True) + eps
+            )
+            if dtype != torch.float32:
+                normalized = normalized.to(dtype).float()
+            expected = (normalized * weight.float()).to(dtype)
             compare("rms_norm", dtype_name, to_torch(output, dtype), expected)
             count("rms_norm", "fixed" if index < 3 else "random")
 
