@@ -10,7 +10,7 @@
 namespace {
 
 template <std::size_t N>
-llaisysTensor_t tensor(const std::array<std::size_t, N> &shape,
+llaisysTensor_t tensor(std::array<std::size_t, N> shape,
                       llaisysDataType_t dtype = LLAISYS_DTYPE_F32) {
     auto result = tensorCreate(
         shape.data(), shape.size(), dtype, LLAISYS_DEVICE_CPU, 0);
