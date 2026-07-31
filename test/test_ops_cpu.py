@@ -216,18 +216,20 @@ def test_linear(dtype_name):
 
 def test_rms_norm(dtype_name):
     dtype = DTYPES[dtype_name][0]
-    cases = [(1, 1), (2, 4), (3, 31)]
+    cases = [(1, 1), (2, 4), (3, 31), (2, 896)]
     rng = random.Random(SEED)
     cases.extend(
         (rng.randint(1, 4), rng.randint(1, 32)) for _ in range(16)
     )
     for index, shape in enumerate(cases):
         for eps in (1e-5, 1e-6):
-            inp = (
-                torch.zeros(shape, dtype=dtype)
-                if index == 0
-                else deterministic_values(shape, dtype, 0.0625)
-            )
+            if index == 0:
+                inp = torch.zeros(shape, dtype=dtype)
+            elif shape[-1] == 896:
+                generator = torch.Generator().manual_seed(8)
+                inp = torch.randn(shape, generator=generator).to(dtype)
+            else:
+                inp = deterministic_values(shape, dtype, 0.0625)
             weight = deterministic_values((shape[-1],), dtype, 0.03125) + 1
             output = empty(shape, dtype_name)
             llaisys.Ops.rms_norm(
@@ -239,7 +241,13 @@ def test_rms_norm(dtype_name):
             if dtype != torch.float32:
                 normalized = normalized.to(dtype).float()
             expected = (normalized * weight.float()).to(dtype)
-            compare("rms_norm", dtype_name, to_torch(output, dtype), expected)
+            compare(
+                "rms_norm",
+                dtype_name,
+                to_torch(output, dtype),
+                expected,
+                exact=dtype_name == "bf16" and shape[-1] == 896,
+            )
             count("rms_norm", "fixed" if index < 3 else "random")
 
 

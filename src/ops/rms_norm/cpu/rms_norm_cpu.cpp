@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#undef __C
+#include <immintrin.h>
 
 namespace {
 
@@ -33,6 +35,42 @@ inline T from_f32(float v) {
     }
 }
 
+__attribute__((target("avx512f,avx512dq,avx512vl,fma")))
+float bf16_sum_squares_avx512(
+    const llaisys::bf16_t *values, size_t count) {
+    __m512 accumulators[4]{
+        _mm512_setzero_ps(), _mm512_setzero_ps(),
+        _mm512_setzero_ps(), _mm512_setzero_ps()};
+    size_t index = 0;
+    for (; index + 64 <= count; index += 64) {
+        for (size_t lane = 0; lane < 4; ++lane) {
+            const __m256i packed = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(
+                    values + index + lane * 16));
+            const __m512 floats = _mm512_castsi512_ps(
+                _mm512_slli_epi32(
+                    _mm512_cvtepu16_epi32(packed), 16));
+            accumulators[lane] = _mm512_add_ps(
+                accumulators[lane], _mm512_mul_ps(floats, floats));
+        }
+    }
+    __m512 accumulator = _mm512_add_ps(
+        accumulators[0], accumulators[1]);
+    accumulator = _mm512_add_ps(accumulator, accumulators[2]);
+    accumulator = _mm512_add_ps(accumulator, accumulators[3]);
+    alignas(64) float lanes[16];
+    _mm512_store_ps(lanes, accumulator);
+    float result = 0.0f;
+    for (size_t lane = 0; lane < 16; ++lane) {
+        result += lanes[lane];
+    }
+    for (; index < count; ++index) {
+        const float value = to_f32(values[index]);
+        result += value * value;
+    }
+    return result;
+}
+
 // RMSNorm 核心计算（朴素实现，按行做归一化）
 // 输入输出视为：
 // - in/out: [M, D]
@@ -50,10 +88,21 @@ void rms_norm_(T* out, const T* in, const T* weight, size_t M, size_t D, float e
         T *out_row = out + m * D;
 
         // 第一步：计算均方mean(x^2>
-        float sum_sq = 0.0f; 
-        for (size_t i = 0; i < D; ++i) {
-            float x = to_f32(in_row[i]);
-            sum_sq += x * x;
+        float sum_sq = 0.0f;
+        if constexpr (std::is_same_v<T, llaisys::bf16_t>) {
+            if (__builtin_cpu_supports("avx512f")) {
+                sum_sq = bf16_sum_squares_avx512(in_row, D);
+            } else {
+                for (size_t i = 0; i < D; ++i) {
+                    const float x = to_f32(in_row[i]);
+                    sum_sq += x * x;
+                }
+            }
+        } else {
+            for (size_t i = 0; i < D; ++i) {
+                const float x = to_f32(in_row[i]);
+                sum_sq += x * x;
+            }
         }
         float mean_sq = sum_sq / static_cast<float>(D);
 
