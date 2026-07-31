@@ -427,6 +427,15 @@ class Qwen2:
             "greedy_token": int(trace.greedy_token),
         }
         for name in (
+            "diagnostic_attn_norm",
+            "diagnostic_q",
+            "diagnostic_k",
+            "diagnostic_v",
+            "diagnostic_q_rope",
+            "diagnostic_k_rope",
+            "diagnostic_attention_scores",
+            "diagnostic_attention_probabilities",
+            "diagnostic_attn_value",
             "diagnostic_post_attention",
             "diagnostic_mlp_norm",
             "diagnostic_gate",
@@ -434,7 +443,9 @@ class Qwen2:
             "diagnostic_activation",
             "diagnostic_mlp_out",
         ):
-            result[name] = self._trace_tensor(getattr(trace, name))
+            handle = getattr(trace, name)
+            if handle:
+                result[name] = self._trace_tensor(handle)
         for layer in range(int(self.meta.nlayer)):
             result[f"layer.{layer}.attention_out"] = self._trace_tensor(
                 trace.attention_out[layer]

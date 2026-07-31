@@ -37,6 +37,15 @@ __C {
         llaisysTensor_t *layer_output;
         llaisysTensor_t final_norm;
         llaisysTensor_t logits;
+        llaisysTensor_t diagnostic_attn_norm;
+        llaisysTensor_t diagnostic_q;
+        llaisysTensor_t diagnostic_k;
+        llaisysTensor_t diagnostic_v;
+        llaisysTensor_t diagnostic_q_rope;
+        llaisysTensor_t diagnostic_k_rope;
+        llaisysTensor_t diagnostic_attention_scores;
+        llaisysTensor_t diagnostic_attention_probabilities;
+        llaisysTensor_t diagnostic_attn_value;
         llaisysTensor_t diagnostic_post_attention;
         llaisysTensor_t diagnostic_mlp_norm;
         llaisysTensor_t diagnostic_gate;

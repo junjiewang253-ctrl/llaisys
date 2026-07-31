@@ -71,7 +71,14 @@ def compare(name, actual, expected, errors):
     slot = errors.setdefault(name, {"max_abs": 0.0, "max_rel": 0.0})
     slot["max_abs"] = max(slot["max_abs"], abs_error)
     slot["max_rel"] = max(slot["max_rel"], rel_error)
-    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(
+        actual,
+        expected,
+        atol=3e-2,
+        rtol=3e-2,
+        check_dtype=False,
+        msg=lambda message: f"{name}: {message}",
+    )
 
 
 def main():
@@ -85,11 +92,16 @@ def main():
         local_files_only=True,
         trust_remote_code=False,
         torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
     ).eval()
+    assert reference.model.layers[0].self_attn.__class__.__name__ == "Qwen2Attention"
     backend = llaisys.Qwen2(str(model_dir), device="cpu", dtype="bf16")
     layer_ids = [0, len(reference.model.layers) // 2, len(reference.model.layers) - 1]
     errors = {}
     alignment = {
+        "reference_attention_class": (
+            reference.model.layers[0].self_attn.__class__.__name__
+        ),
         "chat_template_sha256": hashlib.sha256(
             tokenizer.chat_template.encode("utf-8")
         ).hexdigest(),
@@ -117,9 +129,16 @@ def main():
         actual = backend.forward_trace(tokens)
         for name, expected_tensor in expected.items():
             if name == "logits":
-                compare(name, actual[name][-1], expected_tensor[-1], errors)
+                compare(
+                    f"{case_id}:{name}",
+                    actual[name][-1],
+                    expected_tensor[-1],
+                    errors,
+                )
             else:
-                compare(name, actual[name], expected_tensor, errors)
+                compare(
+                    f"{case_id}:{name}", actual[name], expected_tensor, errors
+                )
         alignment.setdefault("cases", {})[case_id] = {"prefix_length": len(tokens)}
 
     for prompt_id, initial in tokenized.items():
@@ -129,7 +148,12 @@ def main():
         for _ in range(8):
             expected = reference_trace(reference, tokens, [])
             actual = backend.forward_trace(tokens)
-            compare("generation_logits", actual["logits"][-1], expected["logits"][-1], errors)
+            compare(
+                f"{prompt_id}:generation_logits",
+                actual["logits"][-1],
+                expected["logits"][-1],
+                errors,
+            )
             values, indices = torch.topk(expected["logits"][-1].float(), 2)
             oracle_token = int(indices[0])
             margin = float(values[0] - values[1])

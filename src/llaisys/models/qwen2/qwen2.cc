@@ -11,14 +11,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #undef __C
 #include <immintrin.h>
+#include <limits>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#ifdef LLAISYS_USE_DNNL
+#include <oneapi/dnnl/dnnl.hpp>
+#endif
 
 struct LlaisysQwen2Model {
     LlaisysQwen2Meta meta{};
@@ -239,6 +246,15 @@ static void trace_clear(LlaisysQwen2Model *model) {
     tensorDestroy(model->trace.embedding);
     tensorDestroy(model->trace.final_norm);
     tensorDestroy(model->trace.logits);
+    tensorDestroy(model->trace.diagnostic_attn_norm);
+    tensorDestroy(model->trace.diagnostic_q);
+    tensorDestroy(model->trace.diagnostic_k);
+    tensorDestroy(model->trace.diagnostic_v);
+    tensorDestroy(model->trace.diagnostic_q_rope);
+    tensorDestroy(model->trace.diagnostic_k_rope);
+    tensorDestroy(model->trace.diagnostic_attention_scores);
+    tensorDestroy(model->trace.diagnostic_attention_probabilities);
+    tensorDestroy(model->trace.diagnostic_attn_value);
     tensorDestroy(model->trace.diagnostic_post_attention);
     tensorDestroy(model->trace.diagnostic_mlp_norm);
     tensorDestroy(model->trace.diagnostic_gate);
@@ -326,6 +342,222 @@ static void qwen2_rope_bf16(llaisysTensor_t out,
     }
 }
 
+static void qwen2_swiglu_bf16(llaisysTensor_t out,
+                              llaisysTensor_t gate,
+                              llaisysTensor_t up,
+                              size_t elements) {
+    auto *destination =
+        reinterpret_cast<llaisys::bf16_t *>(tensorGetData(out));
+    const auto *gate_data =
+        reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(gate));
+    const auto *up_data =
+        reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(up));
+    for (size_t index = 0; index < elements; ++index) {
+        const float gate_value =
+            llaisys::utils::cast<float>(gate_data[index]);
+        const float up_value =
+            llaisys::utils::cast<float>(up_data[index]);
+        const float sigmoid = 1.0f / (1.0f + std::exp(-gate_value));
+        const auto silu = llaisys::utils::cast<llaisys::bf16_t>(
+            gate_value * sigmoid);
+        destination[index] = llaisys::utils::cast<llaisys::bf16_t>(
+            llaisys::utils::cast<float>(silu) * up_value);
+    }
+}
+
+#ifdef LLAISYS_USE_DNNL
+static void qwen2_attention_bf16(llaisysTensor_t out,
+                                 llaisysTensor_t query,
+                                 llaisysTensor_t key,
+                                 llaisysTensor_t value,
+                                 size_t sequence,
+                                 size_t heads,
+                                 size_t kv_heads,
+                                 size_t dimension,
+                                 size_t value_dimension,
+                                 float scale,
+                                 llaisysTensor_t *score_trace,
+                                 llaisysTensor_t *probability_trace) {
+    const auto *query_data =
+        reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(query));
+    const auto *key_data =
+        reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(key));
+    const auto *value_data =
+        reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(value));
+    auto *destination =
+        reinterpret_cast<llaisys::bf16_t *>(tensorGetData(out));
+    const size_t group = heads / kv_heads;
+    std::vector<llaisys::bf16_t> queries(
+        heads * sequence * dimension);
+    std::vector<llaisys::bf16_t> keys(
+        heads * sequence * dimension);
+    std::vector<llaisys::bf16_t> values(
+        heads * sequence * value_dimension);
+    for (size_t head = 0; head < heads; ++head) {
+        const size_t kv_head = head / group;
+        for (size_t token = 0; token < sequence; ++token) {
+            std::copy_n(
+                query_data + (token * heads + head) * dimension,
+                dimension,
+                queries.data() + (head * sequence + token) * dimension);
+            std::copy_n(
+                key_data + (token * kv_heads + kv_head) * dimension,
+                dimension,
+                keys.data() + (head * sequence + token) * dimension);
+            std::copy_n(
+                value_data +
+                    (token * kv_heads + kv_head) * value_dimension,
+                value_dimension,
+                values.data() +
+                    (head * sequence + token) * value_dimension);
+        }
+    }
+
+    static const dnnl::engine engine(dnnl::engine::kind::cpu, 0);
+    static dnnl::stream stream(engine);
+    const dnnl::memory::dims query_dims{
+        static_cast<dnnl_dim_t>(heads),
+        static_cast<dnnl_dim_t>(sequence),
+        static_cast<dnnl_dim_t>(dimension)};
+    const dnnl::memory::dims query_strides{
+        static_cast<dnnl_dim_t>(sequence * dimension),
+        static_cast<dnnl_dim_t>(dimension), 1};
+    const dnnl::memory::dims key_dims{
+        static_cast<dnnl_dim_t>(heads),
+        static_cast<dnnl_dim_t>(dimension),
+        static_cast<dnnl_dim_t>(sequence)};
+    const dnnl::memory::dims key_strides{
+        static_cast<dnnl_dim_t>(sequence * dimension), 1,
+        static_cast<dnnl_dim_t>(dimension)};
+    const dnnl::memory::dims score_dims{
+        static_cast<dnnl_dim_t>(heads),
+        static_cast<dnnl_dim_t>(sequence),
+        static_cast<dnnl_dim_t>(sequence)};
+    const dnnl::memory::dims score_strides{
+        static_cast<dnnl_dim_t>(sequence * sequence),
+        static_cast<dnnl_dim_t>(sequence), 1};
+    const auto query_desc = dnnl::memory::desc(
+        query_dims, dnnl::memory::data_type::bf16, query_strides);
+    const auto key_desc = dnnl::memory::desc(
+        key_dims, dnnl::memory::data_type::bf16, key_strides);
+    const auto score_desc = dnnl::memory::desc(
+        score_dims, dnnl::memory::data_type::bf16, score_strides);
+    std::vector<llaisys::bf16_t> scores(heads * sequence * sequence);
+    const dnnl::matmul::primitive_desc score_primitive_desc(
+        engine, query_desc, key_desc, score_desc);
+    dnnl::matmul(score_primitive_desc)
+        .execute(
+            stream,
+            {{DNNL_ARG_SRC,
+                 dnnl::memory(query_desc, engine, queries.data())},
+             {DNNL_ARG_WEIGHTS,
+                 dnnl::memory(key_desc, engine, keys.data())},
+             {DNNL_ARG_DST,
+                 dnnl::memory(score_desc, engine, scores.data())}});
+    stream.wait();
+
+    std::vector<float> scaled_scores(heads * sequence * sequence);
+    for (size_t head = 0; head < heads; ++head) {
+        for (size_t row = 0; row < sequence; ++row) {
+            const size_t offset =
+                (head * sequence + row) * sequence;
+            for (size_t column = 0; column <= row; ++column) {
+                const auto scaled = llaisys::utils::cast<llaisys::bf16_t>(
+                    llaisys::utils::cast<float>(scores[offset + column]) *
+                    scale);
+                scores[offset + column] = scaled;
+                scaled_scores[offset + column] =
+                    llaisys::utils::cast<float>(scaled);
+            }
+            for (size_t column = row + 1; column < sequence; ++column) {
+                scores[offset + column] =
+                    llaisys::utils::cast<llaisys::bf16_t>(
+                        -std::numeric_limits<float>::infinity());
+                scaled_scores[offset + column] =
+                    -std::numeric_limits<float>::infinity();
+            }
+        }
+    }
+    const auto probability_f32_desc = dnnl::memory::desc(
+        score_dims, dnnl::memory::data_type::f32, score_strides);
+    std::vector<float> probabilities_f32(
+        heads * sequence * sequence);
+    const auto softmax_primitive_desc =
+        dnnl::softmax_forward::primitive_desc(
+            engine, dnnl::prop_kind::forward_inference,
+            dnnl::algorithm::softmax_accurate,
+            probability_f32_desc, probability_f32_desc, 2);
+    dnnl::softmax_forward(softmax_primitive_desc)
+        .execute(
+            stream,
+            {{DNNL_ARG_SRC,
+                 dnnl::memory(
+                     probability_f32_desc, engine,
+                     scaled_scores.data())},
+             {DNNL_ARG_DST,
+                 dnnl::memory(
+                     probability_f32_desc, engine,
+                     probabilities_f32.data())}});
+    stream.wait();
+    std::vector<llaisys::bf16_t> probabilities(
+        heads * sequence * sequence);
+    for (size_t index = 0; index < probabilities.size(); ++index) {
+        probabilities[index] =
+            llaisys::utils::cast<llaisys::bf16_t>(
+                probabilities_f32[index]);
+    }
+    if (score_trace) {
+        *score_trace = make_tensor_3d(
+            heads, sequence, sequence, LLAISYS_DTYPE_BF16,
+            LLAISYS_DEVICE_CPU, 0);
+        tensorLoad(*score_trace, scores.data());
+        require_op_success("attention score trace");
+    }
+    if (probability_trace) {
+        *probability_trace = make_tensor_3d(
+            heads, sequence, sequence, LLAISYS_DTYPE_BF16,
+            LLAISYS_DEVICE_CPU, 0);
+        tensorLoad(*probability_trace, probabilities.data());
+        require_op_success("attention probability trace");
+    }
+
+    const dnnl::memory::dims value_dims{
+        static_cast<dnnl_dim_t>(heads),
+        static_cast<dnnl_dim_t>(sequence),
+        static_cast<dnnl_dim_t>(value_dimension)};
+    const dnnl::memory::dims value_strides{
+        static_cast<dnnl_dim_t>(sequence * value_dimension),
+        static_cast<dnnl_dim_t>(value_dimension), 1};
+    const auto value_desc = dnnl::memory::desc(
+        value_dims, dnnl::memory::data_type::bf16, value_strides);
+    std::vector<llaisys::bf16_t> attended(
+        heads * sequence * value_dimension);
+    const dnnl::matmul::primitive_desc value_primitive_desc(
+        engine, score_desc, value_desc, value_desc);
+    dnnl::matmul(value_primitive_desc)
+        .execute(
+            stream,
+            {{DNNL_ARG_SRC,
+                 dnnl::memory(
+                     score_desc, engine, probabilities.data())},
+             {DNNL_ARG_WEIGHTS,
+                 dnnl::memory(value_desc, engine, values.data())},
+             {DNNL_ARG_DST,
+                 dnnl::memory(value_desc, engine, attended.data())}});
+    stream.wait();
+    for (size_t token = 0; token < sequence; ++token) {
+        for (size_t head = 0; head < heads; ++head) {
+            std::copy_n(
+                attended.data() +
+                    (head * sequence + token) * value_dimension,
+                value_dimension,
+                destination +
+                    (token * heads + head) * value_dimension);
+        }
+    }
+}
+#endif
+
 __attribute__((target("avx512f,avx512dq,avx512vl,fma")))
 static void qwen2_linear_bf16(llaisysTensor_t out,
                               llaisysTensor_t input,
@@ -340,6 +572,76 @@ static void qwen2_linear_bf16(llaisysTensor_t out,
         reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(input));
     const auto *matrix =
         reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(weight));
+#ifdef LLAISYS_USE_DNNL
+    static const dnnl::engine engine(dnnl::engine::kind::cpu, 0);
+    static dnnl::stream stream(engine);
+    const dnnl::memory::dims source_dims{
+        static_cast<dnnl_dim_t>(rows),
+        static_cast<dnnl_dim_t>(input_size)};
+    const dnnl::memory::dims source_strides{
+        static_cast<dnnl_dim_t>(input_size), 1};
+    const dnnl::memory::dims weight_dims{
+        static_cast<dnnl_dim_t>(input_size),
+        static_cast<dnnl_dim_t>(output_size)};
+    const dnnl::memory::dims weight_strides{
+        1, static_cast<dnnl_dim_t>(input_size)};
+    const dnnl::memory::dims output_dims{
+        static_cast<dnnl_dim_t>(rows),
+        static_cast<dnnl_dim_t>(output_size)};
+    const dnnl::memory::dims output_strides{
+        static_cast<dnnl_dim_t>(output_size), 1};
+    const auto source_desc = dnnl::memory::desc(
+        source_dims, dnnl::memory::data_type::bf16, source_strides);
+    const auto weight_desc = dnnl::memory::desc(
+        weight_dims, dnnl::memory::data_type::bf16, weight_strides);
+    const auto output_desc = dnnl::memory::desc(
+        output_dims, dnnl::memory::data_type::bf16, output_strides);
+    const auto source_memory = dnnl::memory(
+        source_desc, engine, const_cast<llaisys::bf16_t *>(source));
+    const auto weight_memory = dnnl::memory(
+        weight_desc, engine, const_cast<llaisys::bf16_t *>(matrix));
+    const auto output_memory =
+        dnnl::memory(output_desc, engine, destination);
+    std::unordered_map<int, dnnl::memory> arguments{
+        {DNNL_ARG_SRC, source_memory},
+        {DNNL_ARG_WEIGHTS, weight_memory},
+        {DNNL_ARG_DST, output_memory}};
+    dnnl::primitive_attr attribute;
+    if (bias) {
+        const auto *bias_data =
+            reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(bias));
+        for (size_t row = 0; row < rows; ++row) {
+            std::copy_n(
+                bias_data, output_size, destination + row * output_size);
+        }
+        dnnl::post_ops post_ops;
+        post_ops.append_sum();
+        attribute.set_post_ops(post_ops);
+    }
+    const dnnl::matmul::primitive_desc descriptor(
+        engine, source_desc, weight_desc, output_desc, attribute);
+    dnnl::matmul(descriptor).execute(stream, arguments);
+    stream.wait();
+    static bool reported = false;
+    if (!reported) {
+        std::fprintf(
+            stderr, "[qwen2] fixed oneDNN 3.4.2 bf16 matmul: active\n");
+        reported = true;
+    }
+    return;
+#else
+    static bool reported = false;
+    if (!reported) {
+        std::fprintf(
+            stderr, "[qwen2] fixed oneDNN unavailable; AVX fallback\n");
+        reported = true;
+    }
+#endif
+    {
+        (void)destination;
+        (void)source;
+        (void)matrix;
+    }
     for (size_t row = 0; row < rows; ++row) {
         for (size_t output_index = 0; output_index < output_size;
              ++output_index) {
@@ -498,6 +800,15 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
 
         const auto &meta = model->meta;
         const int devid = pick_device_id(model);
+        size_t diagnostic_layer = 0;
+        if (const char *configured =
+                std::getenv("LLAISYS_QWEN2_TRACE_LAYER")) {
+            char *end = nullptr;
+            const auto parsed = std::strtoull(configured, &end, 10);
+            if (end && *end == '\0' && parsed < meta.nlayer) {
+                diagnostic_layer = static_cast<size_t>(parsed);
+            }
+        }
         auto linear = [&](llaisysTensor_t out,
                           llaisysTensor_t input,
                           llaisysTensor_t weight,
@@ -569,6 +880,9 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             TensorGuard xn(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
             llaisysRmsNorm(xn.t, x.t, model->w.attn_norm_w[l], meta.epsilon);
             require_op_success("input RMSNorm");
+            if (l == diagnostic_layer) {
+                model->trace.diagnostic_attn_norm = trace_copy(xn.t);
+            }
 
             if (l == 0) {
                 MARK("L0: qkv linear");
@@ -585,6 +899,11 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             linear(v2.t, xn.t, model->w.attn_v_w[l],
                    model->w.attn_v_b ? model->w.attn_v_b[l] : nullptr,
                    new_len, meta.hs, meta.nkvh * meta.dh);
+            if (l == diagnostic_layer) {
+                model->trace.diagnostic_q = trace_copy(q2.t);
+                model->trace.diagnostic_k = trace_copy(k2.t);
+                model->trace.diagnostic_v = trace_copy(v2.t);
+            }
 
             MARK_L(l, "view qkv -> 3d");
             size_t qshape[3]{new_len, meta.nh, meta.dh};
@@ -611,6 +930,10 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
                 llaisysROPE(k_rope.t, k3.t, t_pos.t, meta.theta);
                 require_op_success("RoPE");
             }
+            if (l == diagnostic_layer) {
+                model->trace.diagnostic_q_rope = trace_copy(q_rope.t);
+                model->trace.diagnostic_k_rope = trace_copy(k_rope.t);
+            }
 
             if (l == 0) {
                 MARK("L0: self_attention");
@@ -627,8 +950,32 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
                 dump_shape("attn_val(out, pre)", attn_val.t);
             }
 
-            llaisysSelfAttention(attn_val.t, q_rope.t, k_rope.t, v3.t, attn_scale);
-            require_op_success("self attention");
+            if (model->device == LLAISYS_DEVICE_CPU &&
+                meta.dtype == LLAISYS_DTYPE_BF16) {
+#ifdef LLAISYS_USE_DNNL
+                qwen2_attention_bf16(
+                    attn_val.t, q_rope.t, k_rope.t, v3.t,
+                    new_len, meta.nh, meta.nkvh, meta.dh, dv,
+                    attn_scale,
+                    l == diagnostic_layer
+                        ? &model->trace.diagnostic_attention_scores
+                        : nullptr,
+                    l == diagnostic_layer
+                        ? &model->trace.diagnostic_attention_probabilities
+                        : nullptr);
+#else
+                llaisysSelfAttention(
+                    attn_val.t, q_rope.t, k_rope.t, v3.t, attn_scale);
+                require_op_success("self attention");
+#endif
+            } else {
+                llaisysSelfAttention(
+                    attn_val.t, q_rope.t, k_rope.t, v3.t, attn_scale);
+                require_op_success("self attention");
+            }
+            if (l == diagnostic_layer) {
+                model->trace.diagnostic_attn_value = trace_copy(attn_val.t);
+            }
 
             if (l == 0) {
                 dump_shape("attn_val(out, post)", attn_val.t);
@@ -649,7 +996,7 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             MARK_L(l, "residual add 1");
             TensorGuard x1(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
             llaisysAdd(x1.t, x.t, attn_out.t);
-            if (l == 0) {
+            if (l == diagnostic_layer) {
                 model->trace.diagnostic_post_attention = trace_copy(x1.t);
             }
 
@@ -658,7 +1005,7 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             }
             TensorGuard x1n(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
             llaisysRmsNorm(x1n.t, x1.t, model->w.mlp_norm_w[l], meta.epsilon);
-            if (l == 0) {
+            if (l == diagnostic_layer) {
                 model->trace.diagnostic_mlp_norm = trace_copy(x1n.t);
             }
 
@@ -668,21 +1015,28 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
                    new_len, meta.hs, meta.di);
             linear(up.t, x1n.t, model->w.mlp_up_w[l], nullptr,
                    new_len, meta.hs, meta.di);
-            if (l == 0) {
+            if (l == diagnostic_layer) {
                 model->trace.diagnostic_gate = trace_copy(gate.t);
                 model->trace.diagnostic_up = trace_copy(up.t);
             }
 
             TensorGuard act(make_tensor_2d(new_len, meta.di, meta.dtype, model->device, devid));
-            llaisysSwiGLU(act.t, gate.t, up.t);
-            if (l == 0) {
+            if (model->device == LLAISYS_DEVICE_CPU &&
+                meta.dtype == LLAISYS_DTYPE_BF16) {
+                qwen2_swiglu_bf16(
+                    act.t, gate.t, up.t, new_len * meta.di);
+            } else {
+                llaisysSwiGLU(act.t, gate.t, up.t);
+                require_op_success("swiglu");
+            }
+            if (l == diagnostic_layer) {
                 model->trace.diagnostic_activation = trace_copy(act.t);
             }
 
             TensorGuard mlp_out(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
             linear(mlp_out.t, act.t, model->w.mlp_down_w[l], nullptr,
                    new_len, meta.di, meta.hs);
-            if (l == 0) {
+            if (l == diagnostic_layer) {
                 model->trace.diagnostic_mlp_out = trace_copy(mlp_out.t);
             }
 

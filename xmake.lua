@@ -13,6 +13,12 @@ option("nv-gpu")
     set_description("Whether to compile implementations for Nvidia GPU")
 option_end()
 
+option("dnnl-root")
+    set_default("")
+    set_showmenu(true)
+    set_description("Pinned user-space oneDNN installation for CPU BF16 math")
+option_end()
+
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
     includes("xmake/nvidia.lua")
@@ -107,6 +113,15 @@ target("llaisys")
     set_warnings("all", "error")
     add_files("src/llaisys/**.cc")
     set_installdir(".")
+
+    local dnnl_root = get_config("dnnl-root")
+    if dnnl_root and #dnnl_root > 0 then
+        add_defines("LLAISYS_USE_DNNL")
+        add_includedirs(path.join(dnnl_root, "include"))
+        add_linkdirs(path.join(dnnl_root, "lib"))
+        add_links("dnnl")
+        add_rpathdirs(path.join(dnnl_root, "lib"))
+    end
 
     
     after_install(function (target)
