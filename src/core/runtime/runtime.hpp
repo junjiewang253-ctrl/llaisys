@@ -10,7 +10,6 @@ private:
     llaisysDeviceType_t _device_type;
     int _device_id;
     const LlaisysRuntimeAPI *_api;
-    MemoryAllocator *_allocator;
     bool _is_active;
     void _activate();
     void _deactivate();
@@ -39,8 +38,6 @@ public:
     storage_t allocateDeviceStorage(size_t size);
     ;
     storage_t allocateHostStorage(size_t size);
-    void freeStorage(Storage *storage);
-
     llaisysStream_t stream() const;
     void synchronize() const;
 };

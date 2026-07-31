@@ -76,3 +76,20 @@ def load_tensor(lib):
         c_size_t,  # end  : exclusive
     ]
     lib.tensorSlice.restype = llaisysTensor_t
+
+    lib.tensorContiguous.argtypes = [llaisysTensor_t]
+    lib.tensorContiguous.restype = llaisysTensor_t
+
+    lib.tensorReshape.argtypes = [
+        llaisysTensor_t,
+        POINTER(c_size_t),
+        c_size_t,
+    ]
+    lib.tensorReshape.restype = llaisysTensor_t
+
+    lib.tensorTo.argtypes = [
+        llaisysTensor_t,
+        llaisysDeviceType_t,
+        c_int,
+    ]
+    lib.tensorTo.restype = llaisysTensor_t

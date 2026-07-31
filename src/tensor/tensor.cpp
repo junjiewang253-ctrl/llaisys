@@ -1,13 +1,98 @@
-﻿#include "tensor.hpp"
+#include "tensor.hpp"
 
+#include "../llaisys/error.hpp"
 #include "../utils.hpp"
 
+#include <algorithm>
 #include <cstring> // 内存操作库，如memcpy。
+#include <limits>
 #include <numeric> // 数值算法，如accumulate。
 #include <sstream> // 字符串流。
-#include <algorithm>
 
 namespace llaisys {
+namespace {
+
+size_t checkedMul(size_t lhs, size_t rhs, const char *what) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        throw std::invalid_argument(what);
+    }
+    return lhs * rhs;
+}
+
+ptrdiff_t checkedStrideMul(ptrdiff_t lhs, size_t rhs) {
+    if (lhs < 0
+        || (lhs != 0
+            && rhs > static_cast<size_t>(
+                         std::numeric_limits<ptrdiff_t>::max() / lhs))) {
+        throw std::invalid_argument("tensor stride overflow");
+    }
+    return lhs * static_cast<ptrdiff_t>(rhs);
+}
+
+std::vector<ptrdiff_t> denseStrides(const std::vector<size_t> &shape) {
+    std::vector<ptrdiff_t> strides(shape.size());
+    ptrdiff_t stride = 1;
+    for (size_t i = shape.size(); i != 0; --i) {
+        strides[i - 1] = stride;
+        stride = checkedStrideMul(stride, shape[i - 1]);
+    }
+    return strides;
+}
+
+void copyLogicalCpu(const Tensor &source, Tensor &destination) {
+    if (source.numel() == 0) {
+        return;
+    }
+    const auto element_size = source.elementSize();
+    const auto &shape = source.shape();
+    const auto &strides = source.strides();
+    const auto *src = source.data();
+    auto *dst = destination.data();
+    size_t linear = 0;
+    auto visit = [&](auto &&self, size_t dim, ptrdiff_t offset) -> void {
+        if (dim == shape.size()) {
+            std::memcpy(dst + linear * element_size,
+                        src + static_cast<size_t>(offset) * element_size,
+                        element_size);
+            ++linear;
+            return;
+        }
+        for (size_t i = 0; i < shape[dim]; ++i) {
+            self(self,
+                 dim + 1,
+                 offset + static_cast<ptrdiff_t>(i) * strides[dim]);
+        }
+    };
+    visit(visit, 0, 0);
+}
+
+void scatterLogicalCpu(Tensor &destination, const std::byte *source) {
+    if (destination.numel() == 0) {
+        return;
+    }
+    const auto element_size = destination.elementSize();
+    const auto &shape = destination.shape();
+    const auto &strides = destination.strides();
+    auto *dst = destination.data();
+    size_t linear = 0;
+    auto visit = [&](auto &&self, size_t dim, ptrdiff_t offset) -> void {
+        if (dim == shape.size()) {
+            std::memcpy(dst + static_cast<size_t>(offset) * element_size,
+                        source + linear * element_size,
+                        element_size);
+            ++linear;
+            return;
+        }
+        for (size_t i = 0; i < shape[dim]; ++i) {
+            self(self,
+                 dim + 1,
+                 offset + static_cast<ptrdiff_t>(i) * strides[dim]);
+        }
+    };
+    visit(visit, 0, 0);
+}
+
+} // namespace
 
 Tensor::Tensor(TensorMeta meta, core::storage_t storage, size_t offset)
     : _meta(std::move(meta)), _storage(std::move(storage)), _offset(offset) {} // std::move用于移动语义，避免拷贝。
@@ -17,23 +102,31 @@ tensor_t Tensor::create(const std::vector<size_t> &shape,
                         llaisysDataType_t dtype,
                         llaisysDeviceType_t device_type,
                         int device) {
-    size_t ndim_ = shape.size();
-    std::vector<ptrdiff_t> strides(ndim_);
-    size_t stride = 1;
-    for (size_t i = 1; i <= ndim_; i++) {
-        strides[ndim_ - i] = stride;
-        stride *= shape[ndim_ - i];
+    const auto strides = denseStrides(shape);
+    size_t total_elems = 1;
+    for (const auto dim : shape) {
+        total_elems = checkedMul(total_elems, dim, "tensor numel overflow");
+    }
+    const size_t dtype_size = utils::dsize(dtype);
+    const size_t total_bytes =
+        checkedMul(total_elems, dtype_size, "tensor byte size overflow");
+#ifndef ENABLE_NVIDIA_API
+    if (device_type != LLAISYS_DEVICE_CPU) {
+        throw capi::NotSupportedError("device is not enabled in this build");
+    }
+#endif
+    if (device_type < LLAISYS_DEVICE_CPU
+        || device_type >= LLAISYS_DEVICE_TYPE_COUNT) {
+        throw std::invalid_argument("invalid device type");
     }
     TensorMeta meta{dtype, shape, strides};
-    size_t total_elems = stride;
-    size_t dtype_size = utils::dsize(dtype);
 
     if (device_type == LLAISYS_DEVICE_CPU && core::context().runtime().deviceType() != LLAISYS_DEVICE_CPU) {
-        auto storage = core::context().runtime().allocateHostStorage(total_elems * dtype_size);
+        auto storage = core::context().runtime().allocateHostStorage(total_bytes);
         return std::shared_ptr<Tensor>(new Tensor(meta, storage));
     } else {
         core::context().setDevice(device_type, device);
-        auto storage = core::context().runtime().allocateDeviceStorage(total_elems * dtype_size);
+        auto storage = core::context().runtime().allocateDeviceStorage(total_bytes);
         return std::shared_ptr<Tensor>(new Tensor(meta, storage));
     }
 }
@@ -72,8 +165,11 @@ int Tensor::deviceId() const {
 }
 
 size_t Tensor::numel() const {
-    // std::accumulate：算法函数，计算乘积。语法：std::accumulate(迭代器开始, 结束, 初始值, 操作)
-    return std::accumulate(_meta.shape.begin(), _meta.shape.end(), size_t(1), std::multiplies<size_t>());
+    size_t result = 1;
+    for (const auto dim : _meta.shape) {
+        result = checkedMul(result, dim, "tensor numel overflow");
+    }
+    return result;
 }
 
 size_t Tensor::elementSize() const {
@@ -244,26 +340,17 @@ tensor_t Tensor::view(const std::vector<size_t> &new_shape_in) const {
     const size_t old_numel = this->numel();
     size_t new_numel = 1;
     for (size_t d : new_shape_in) {
-        if (d == 0) {
-            throw std::invalid_argument("Tensor::view: new shape contains 0");
-        }
-        new_numel *= d;
+        new_numel = checkedMul(new_numel, d, "Tensor::view: numel overflow");
     }
     if (old_numel != new_numel) {
         throw std::invalid_argument("Tensor::view: numel mismatch");
     }
     // 0维（标量）或只有一个元素：任意同numel的形状都可视为连续映射
-    if (old_numel <= 1) {
+    if (old_numel <= 1 || this->isContiguous()) {
         TensorMeta meta;
         meta.dtype = this->dtype();
         meta.shape = new_shape_in;
-        meta.strides.assign(new_shape_in.size(), 0);
-
-        ptrdiff_t st = 1;
-        for (int i = static_cast<int>(new_shape_in.size()) - 1; i >= 0; --i) {
-            meta.strides[i] = st;
-            st *= static_cast<ptrdiff_t>(new_shape_in[i]);
-        }
+        meta.strides = denseStrides(new_shape_in);
 
         return std::shared_ptr<Tensor>(new Tensor(meta, this->_storage, this->_offset));
     }
@@ -291,7 +378,7 @@ tensor_t Tensor::view(const std::vector<size_t> &new_shape_in) const {
     }
     // 兜底：如果都被压缩没了（理论上numel>1不会发生），按contiguous处理
     if (dims.empty()) {
-        TensorMeta meta; 
+        TensorMeta meta;
         meta.dtype = this->dtype();
         meta.shape = new_shape_in;
         meta.strides.assign(new_shape_in.size(), 0);
@@ -299,7 +386,7 @@ tensor_t Tensor::view(const std::vector<size_t> &new_shape_in) const {
         ptrdiff_t st = 1;
         for (int i = static_cast<int>(new_shape_in.size()) - 1; i >= 0; --i) {
             meta.strides[i] = st;
-            st *= static_cast<ptrdiff_t>(new_shape_in[i]);
+            st = checkedStrideMul(st, new_shape_in[i]);
         }
         return std::shared_ptr<Tensor>(new Tensor(meta, this->_storage, this->_offset));
     }
@@ -315,9 +402,11 @@ tensor_t Tensor::view(const std::vector<size_t> &new_shape_in) const {
         for (int i = static_cast<int>(dims.size()) - 2; i >= 0; --i) {
             // 若 dims[i].stride == dims[i+1].stride * dims[i+1].size
             // 表示这两维在内存中是紧密连续递推关系，可以同属一个 chunk
-            const ptrdiff_t expected = dims[i + 1].stride * static_cast<ptrdiff_t>(dims[i + 1].size);
+            const ptrdiff_t expected =
+                checkedStrideMul(dims[i + 1].stride, dims[i + 1].size);
             if (dims[i].stride == expected) {
-                curr_numel *= dims[i].size;
+                curr_numel =
+                    checkedMul(curr_numel, dims[i].size, "view chunk overflow");
             }
             else {
                 // 断开：结束一个chunk
@@ -353,28 +442,28 @@ tensor_t Tensor::view(const std::vector<size_t> &new_shape_in) const {
         const ptrdiff_t inner = chunk_inner_stride[c];
 
         if (pos > new_sizes.size()) {
-            throw std::runtime_error("Tensor::view: shape not compatible with strides");
+            throw std::invalid_argument("Tensor::view: shape not compatible with strides");
         }
         size_t prod = 1;
         size_t k = pos;
         while (k < new_sizes.size() && prod < target) {
-            prod *= new_sizes[k];
+            prod = checkedMul(prod, new_sizes[k], "view shape overflow");
             ++k;
         }
         if (prod != target) {
-            throw std::runtime_error("Tensor::view: shape not compatible with strides");
+            throw std::invalid_argument("Tensor::view: shape not compatible with strides");
         }
         // 对 new_sizes[pos..k-1] 这一段生成 strides（chunk 内按 contiguous 推导，但以 inner 为最后一维 stride）
         ptrdiff_t st = inner;
         for (int i = static_cast<int>(k) - 1; i >= static_cast<int>(pos); --i) {
             new_strides_no1[i] = st;
-            st *= static_cast<ptrdiff_t>(new_sizes[i]);
+            st = checkedStrideMul(st, new_sizes[i]);
         }
         pos = k;
     }
     if (pos != new_sizes.size()) {
         // new_sizes 还剩维度没有对应到旧 chunk 的边界上
-        throw std::runtime_error("Tensor::view: shape not compatible with strides");
+        throw std::invalid_argument("Tensor::view: shape not compatible with strides");
     }
     // 把 size==1 的维度 stride 填回去：给一个合理值即可（不影响实际访问）
     // 我们用 contiguous 的默认 stride 来填 size==1 的维度。
@@ -384,7 +473,7 @@ tensor_t Tensor::view(const std::vector<size_t> &new_shape_in) const {
         ptrdiff_t st = 1;
         for (int i = static_cast<int>(new_shape_in.size()) - 1; i >= 0; --i) {
             contig[i] = st;
-            st *= static_cast<ptrdiff_t>(new_shape_in[i]);
+            st = checkedStrideMul(st, new_shape_in[i]);
         }
 
         size_t p = 0;
@@ -436,14 +525,26 @@ tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
 }
 
 void Tensor::load(const void *src_) {
-    if (src_ == nullptr) {
+    const size_t nbytes =
+        checkedMul(this->numel(), this->elementSize(), "tensor byte overflow");
+    if (nbytes != 0 && src_ == nullptr) {
         throw std::invalid_argument("Tensor::load: src is nullptr");
     }
+    if (nbytes == 0) {
+        return;
+    }
     core::context().setDevice(this->deviceType(), this->deviceId());
-    const size_t nbytes = this->numel() * this->elementSize();
     if (this->deviceType() == LLAISYS_DEVICE_CPU) {
-        std::memcpy(this->data(), src_, nbytes);
+        if (this->isContiguous()) {
+            std::memcpy(this->data(), src_, nbytes);
+        } else {
+            scatterLogicalCpu(*this, static_cast<const std::byte *>(src_));
+        }
     } else {
+        if (!this->isContiguous()) {
+            throw capi::NotSupportedError(
+                "non-contiguous device load is not supported");
+        }
         core::context().runtime().api()->memcpy_sync(
             this->data(),
             src_,
@@ -453,18 +554,40 @@ void Tensor::load(const void *src_) {
 }
 
 tensor_t Tensor::contiguous() const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (isContiguous()) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+    if (deviceType() != LLAISYS_DEVICE_CPU) {
+        throw capi::NotSupportedError(
+            "device contiguous copy is not implemented");
+    }
+    auto result = create(shape(), dtype(), deviceType(), deviceId());
+    copyLogicalCpu(*this, *result);
+    return result;
 }
 
 tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    size_t requested = 1;
+    for (const auto dim : shape) {
+        requested = checkedMul(requested, dim, "reshape numel overflow");
+    }
+    if (requested != numel()) {
+        throw std::invalid_argument("reshape numel mismatch");
+    }
+    try {
+        return view(shape);
+    } catch (const std::invalid_argument &) {
+        auto dense = contiguous();
+        return dense->view(shape);
+    }
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (device_type == LLAISYS_DEVICE_CPU && (device == 0 || device == -1)
+        && this->deviceType() == LLAISYS_DEVICE_CPU) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+    throw capi::NotSupportedError("requested tensor transfer is not supported");
 }
 
 } // namespace llaisys

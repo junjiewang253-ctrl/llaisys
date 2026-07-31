@@ -1,22 +1,16 @@
 #include "runtime.hpp"
 
 #include "../../device/runtime_api.hpp"
-#include "../allocator/naive_allocator.hpp"
+#include <new>
 
 namespace llaisys::core {
 Runtime::Runtime(llaisysDeviceType_t device_type, int device_id)
     : _device_type(device_type), _device_id(device_id), _is_active(false) {
     _api = llaisys::device::getRuntimeAPI(_device_type);
     _stream = _api->create_stream();
-    _allocator = new allocators::NaiveAllocator(_api);
 }
 
 Runtime::~Runtime() {
-    if (!_is_active) {
-        std::cerr << "Mallicious destruction of inactive runtime." << std::endl;
-    }
-    delete _allocator;
-    _allocator = nullptr;
     _api->destroy_stream(_stream);
     _api = nullptr;
 }
@@ -47,19 +41,21 @@ const LlaisysRuntimeAPI *Runtime::api() const {
 }
 
 storage_t Runtime::allocateDeviceStorage(size_t size) {
-    return std::shared_ptr<Storage>(new Storage(_allocator->allocate(size), size, *this, false));
+    auto memory = static_cast<std::byte *>(_api->malloc_device(size));
+    if (size != 0 && memory == nullptr) {
+        throw std::bad_alloc();
+    }
+    return std::shared_ptr<Storage>(
+        new Storage(memory, size, _api, _device_type, _device_id, false));
 }
 
 storage_t Runtime::allocateHostStorage(size_t size) {
-    return std::shared_ptr<Storage>(new Storage((std::byte *)_api->malloc_host(size), size, *this, true));
-}
-
-void Runtime::freeStorage(Storage *storage) {
-    if (storage->isHost()) {
-        _api->free_host(storage->memory());
-    } else {
-        _allocator->release(storage->memory());
+    auto memory = static_cast<std::byte *>(_api->malloc_host(size));
+    if (size != 0 && memory == nullptr) {
+        throw std::bad_alloc();
     }
+    return std::shared_ptr<Storage>(
+        new Storage(memory, size, _api, LLAISYS_DEVICE_CPU, 0, true));
 }
 
 llaisysStream_t Runtime::stream() const {

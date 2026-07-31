@@ -15,11 +15,14 @@ Context::Context() {
     // Create runtimes for each device type.
     // Activate the first available device. If no other device is available, activate CPU runtime.
     for (auto device_type : device_typs) {
-        const LlaisysRuntimeAPI *api_ = llaisysGetRuntimeAPI(device_type);
+        const LlaisysRuntimeAPI *api_ = llaisys::device::getRuntimeAPI(device_type);
         int device_count = api_->get_device_count();
-        std::vector<Runtime *> runtimes_(device_count);
+        if (device_count <= 0) {
+            _runtime_map[device_type] = {};
+            continue;
+        }
+        std::vector<Runtime *> runtimes_(static_cast<size_t>(device_count), nullptr);
         for (int device_id = 0; device_id < device_count; device_id++) {
-
             if (_current_runtime == nullptr) {
                 auto runtime = new Runtime(device_type, device_id);
                 runtime->_activate();
@@ -32,18 +35,12 @@ Context::Context() {
 }
 
 Context::~Context() {
-    // Destroy current runtime first.
-    delete _current_runtime;
-
     for (auto &runtime_entry : _runtime_map) {
-        std::vector<Runtime *> runtimes = runtime_entry.second;
-        for (auto runtime : runtimes) {
-            if (runtime != nullptr && runtime != _current_runtime) {
-                runtime->_activate();
+        for (auto runtime : runtime_entry.second) {
+            if (runtime != nullptr) {
                 delete runtime;
             }
         }
-        runtimes.clear();
     }
     _current_runtime = nullptr;
     _runtime_map.clear();
@@ -52,8 +49,12 @@ Context::~Context() {
 void Context::setDevice(llaisysDeviceType_t device_type, int device_id) {
     // If doest not match the current runtime.
     if (_current_runtime == nullptr || _current_runtime->deviceType() != device_type || _current_runtime->deviceId() != device_id) {
-        auto runtimes = _runtime_map[device_type];
-        CHECK_ARGUMENT((size_t)device_id < runtimes.size() && device_id >= 0, "invalid device id");
+        auto found = _runtime_map.find(device_type);
+        CHECK_ARGUMENT(found != _runtime_map.end(), "invalid device type");
+        auto &runtimes = found->second;
+        CHECK_ARGUMENT(device_id >= 0
+                           && static_cast<size_t>(device_id) < runtimes.size(),
+                       "invalid device id");
         if (_current_runtime != nullptr) {
             _current_runtime->_deactivate();
         }

@@ -1,5 +1,5 @@
 #pragma once
-#include "llaisys.h"
+#include "llaisys/runtime.h"
 
 #include "../core.hpp"
 
@@ -10,9 +10,16 @@ class Storage {
 private:
     std::byte *_memory;
     size_t _size;
-    Runtime &_runtime;
+    const LlaisysRuntimeAPI *_api;
+    llaisysDeviceType_t _device_type;
+    int _device_id;
     bool _is_host;
-    Storage(std::byte *memory, size_t size, Runtime &runtime, bool is_host);
+    Storage(std::byte *memory,
+            size_t size,
+            const LlaisysRuntimeAPI *api,
+            llaisysDeviceType_t device_type,
+            int device_id,
+            bool is_host);
 
 public:
     friend class Runtime;

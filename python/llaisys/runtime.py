@@ -1,6 +1,7 @@
 from . import libllaisys
 from .libllaisys import LIB_LLAISYS
 from ctypes import c_void_p
+from .libllaisys import check_last_error
 
 
 class RuntimeAPI:
@@ -8,41 +9,51 @@ class RuntimeAPI:
         self._api = LIB_LLAISYS.llaisysGetRuntimeAPI(
             libllaisys.llaisysDeviceType_t(device_type)
         )
+        check_last_error()
 
     def get_device_count(self) -> int:
         result = self._api.contents.get_device_count()
+        check_last_error()
         return result
 
     def set_device(self, device_id: int) -> None:
         self._api.contents.set_device(device_id)
+        check_last_error()
 
     def device_synchronize(self) -> None:
         self._api.contents.device_synchronize()
+        check_last_error()
 
     def create_stream(self) -> libllaisys.llaisysStream_t:
         stream = self._api.contents.create_stream()
+        check_last_error()
         return stream
 
     def destroy_stream(self, stream: libllaisys.llaisysStream_t) -> None:
         self._api.contents.destroy_stream(stream)
+        check_last_error()
 
     def stream_synchronize(self, stream: libllaisys.llaisysStream_t) -> None:
         self._api.contents.stream_synchronize(stream)
+        check_last_error()
 
     def malloc_device(self, size: int) -> c_void_p:
         ptr = self._api.contents.malloc_device(size)
+        check_last_error()
         return ptr
 
     def free_device(self, ptr: c_void_p) -> None:
-        print(f"[llaisys] free_device({ptr})")
         self._api.contents.free_device(ptr)
+        check_last_error()
 
     def malloc_host(self, size: int) -> c_void_p:
         ptr = self._api.contents.malloc_host(size)
+        check_last_error()
         return ptr
 
     def free_host(self, ptr: c_void_p) -> None:
         self._api.contents.free_host(ptr)
+        check_last_error()
 
     def memcpy_sync(
         self,
@@ -54,6 +65,7 @@ class RuntimeAPI:
         self._api.contents.memcpy_sync(
             dst, src, size, libllaisys.llaisysMemcpyKind_t(kind)
         )
+        check_last_error()
 
     def memcpy_async(
         self,
@@ -66,3 +78,4 @@ class RuntimeAPI:
         self._api.contents.memcpy_async(
             dst, src, size, libllaisys.llaisysMemcpyKind_t(kind), stream
         )
+        check_last_error()

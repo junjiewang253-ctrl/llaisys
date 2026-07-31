@@ -1,55 +1,81 @@
 #include "runtime_api.hpp"
+#include "../llaisys/error.hpp"
 
 namespace llaisys::device {
 
 int getDeviceCount() {
-    return 0;
+    return llaisys::capi::guard<int>(-1, [] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+        return 0;
+    });
 }
 
 void setDevice(int) {
-    EXCEPTION_UNSUPPORTED_DEVICE;
+    llaisys::capi::guardVoid([] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+    });
 }
 
 void deviceSynchronize() {
-    EXCEPTION_UNSUPPORTED_DEVICE;
+    llaisys::capi::guardVoid([] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+    });
 }
 
 llaisysStream_t createStream() {
-    EXCEPTION_UNSUPPORTED_DEVICE;
-    return nullptr;
+    return llaisys::capi::guard<llaisysStream_t>(nullptr, [] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+        return static_cast<llaisysStream_t>(nullptr);
+    });
 }
 
-void destroyStream(llaisysStream_t stream) {
-    EXCEPTION_UNSUPPORTED_DEVICE;
+void destroyStream(llaisysStream_t) {
+    llaisys::capi::guardVoid([] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+    });
 }
-void streamSynchronize(llaisysStream_t stream) {
-    EXCEPTION_UNSUPPORTED_DEVICE;
-}
-
-void *mallocDevice(size_t size) {
-    EXCEPTION_UNSUPPORTED_DEVICE;
-    return nullptr;
-}
-
-void freeDevice(void *ptr) {
-    EXCEPTION_UNSUPPORTED_DEVICE;
+void streamSynchronize(llaisysStream_t) {
+    llaisys::capi::guardVoid([] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+    });
 }
 
-void *mallocHost(size_t size) {
-    EXCEPTION_UNSUPPORTED_DEVICE;
-    return nullptr;
+void *mallocDevice(size_t) {
+    return llaisys::capi::guard<void *>(nullptr, [] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+        return static_cast<void *>(nullptr);
+    });
 }
 
-void freeHost(void *ptr) {
-    EXCEPTION_UNSUPPORTED_DEVICE;
+void freeDevice(void *) {
+    llaisys::capi::guardVoid([] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+    });
 }
 
-void memcpySync(void *dst, const void *src, size_t size, llaisysMemcpyKind_t kind) {
-    EXCEPTION_UNSUPPORTED_DEVICE;
+void *mallocHost(size_t) {
+    return llaisys::capi::guard<void *>(nullptr, [] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+        return static_cast<void *>(nullptr);
+    });
 }
 
-void memcpyAsync(void *dst, const void *src, size_t size, llaisysMemcpyKind_t kind, llaisysStream_t stream) {
-    EXCEPTION_UNSUPPORTED_DEVICE;
+void freeHost(void *) {
+    llaisys::capi::guardVoid([] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+    });
+}
+
+void memcpySync(void *, const void *, size_t, llaisysMemcpyKind_t) {
+    llaisys::capi::guardVoid([] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+    });
+}
+
+void memcpyAsync(void *, const void *, size_t, llaisysMemcpyKind_t, llaisysStream_t) {
+    llaisys::capi::guardVoid([] {
+        throw llaisys::capi::NotSupportedError("unsupported device runtime");
+    });
 }
 
 static const LlaisysRuntimeAPI NOOP_RUNTIME_API = {
@@ -82,8 +108,7 @@ const LlaisysRuntimeAPI *getRuntimeAPI(llaisysDeviceType_t device_type) {
         return getUnsupportedRuntimeAPI();
 #endif
     default:
-        EXCEPTION_UNSUPPORTED_DEVICE;
-        return nullptr;
+        throw std::invalid_argument("invalid device type");
     }
 }
 } // namespace llaisys::device

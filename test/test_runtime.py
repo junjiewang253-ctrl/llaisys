@@ -51,6 +51,8 @@ def test_memcpy(api, size_bytes: int):
     )
 
     torch.testing.assert_close(a, b)
+    api.free_device(device_a)
+    api.free_device(device_b)
 
 
 if __name__ == "__main__":

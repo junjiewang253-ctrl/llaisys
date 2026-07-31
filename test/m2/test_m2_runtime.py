@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import ctypes
+import threading
 
 from m2.test_m2_abi import (
     CPU,
@@ -7,6 +8,8 @@ from m2.test_m2_abi import (
     NOT_SUPPORTED,
     error,
     load_lib,
+    make_tensor,
+    require_success,
 )
 
 
@@ -91,8 +94,41 @@ def test_runtime() -> None:
     unsupported = lib.llaisysGetRuntimeAPI(99)
     assert not unsupported
     assert error(lib)[0] in (INVALID_ARGUMENT, NOT_SUPPORTED)
+
+    survivors = []
+
+    def lifecycle_worker(worker_id):
+        local = load_lib()
+        for iteration in range(128):
+            handle = make_tensor(local, (2, 3))
+            payload = (ctypes.c_float * 6)(
+                *[float(worker_id * 1000 + iteration + i) for i in range(6)]
+            )
+            local.tensorLoad(handle, payload)
+            require_success(local)
+            if iteration == 127:
+                survivors.append((local, handle))
+            else:
+                local.tensorDestroy(handle)
+                require_success(local)
+
+    threads = [
+        threading.Thread(target=lifecycle_worker, args=(worker_id,))
+        for worker_id in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(survivors) == 8
+    for local, handle in survivors:
+        assert local.tensorGetNdim(handle) == 2
+        require_success(local)
+        local.tensorDestroy(handle)
+        require_success(local)
     print("M2-T01 PASS")
     print("M2-T02 PASS")
+    print("M2-T03 PASS")
 
 
 if __name__ == "__main__":
