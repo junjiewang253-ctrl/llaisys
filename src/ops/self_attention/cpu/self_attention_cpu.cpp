@@ -21,6 +21,15 @@ static inline T from_f32(float x) {
     return llaisys::utils::cast<T>(x);
 }
 
+template <typename T>
+static inline float dtype_round(float value) {
+    if constexpr (std::is_same_v<T, llaisys::bf16_t> ||
+                  std::is_same_v<T, llaisys::fp16_t>) {
+        return to_f32(from_f32<T>(value));
+    }
+    return value;
+}
+
 /*
 q:   [seqlen, nhead, d]
 k:   [total_len, nkvhead, d]
@@ -97,14 +106,14 @@ static void self_attention_(T *out,
                 for (size_t i = 0; i < d; ++i) {
                     dot += to_f32(q_ptr[i]) * to_f32(k_ptr[i]);
                 }
-                const float logit = dot * scale;
+                const float logit =
+                    dtype_round<T>(dtype_round<T>(dot) * scale);
                 if (logit > max_logit) {
                     max_logit = logit;
                 }
             }
 
-            // 第 2 遍：softmax + 加权求和 v
-            std::fill(acc.begin(), acc.end(), 0.f);
+            // 第 2 遍：f32 softmax denominator.
             float denom = 0.f;
 
             for (size_t tk = 0; tk <= max_k; ++tk) {
@@ -114,15 +123,11 @@ static void self_attention_(T *out,
                 for (size_t i = 0; i < d; ++i) {
                     dot += to_f32(q_ptr[i]) * to_f32(k_ptr[i]);
                 }
-                const float logit = dot * scale;
+                const float logit =
+                    dtype_round<T>(dtype_round<T>(dot) * scale);
 
                 const float w = std::exp(logit - max_logit);
                 denom += w;
-
-                const T *v_ptr = v + (tk * nkvhead + kh) * dv;
-                for (size_t j = 0; j < dv; ++j) {
-                    acc[j] += w * to_f32(v_ptr[j]);
-                }
             }
 
             const size_t out_off = (tq * nhead + h) * dv;
@@ -135,9 +140,26 @@ static void self_attention_(T *out,
                 continue;
             }
 
-            const float inv_denom = 1.f / denom;
+            // PyTorch/Qwen2 casts softmax probabilities back to the query
+            // dtype before the value matmul.
+            std::fill(acc.begin(), acc.end(), 0.f);
+            for (size_t tk = 0; tk <= max_k; ++tk) {
+                const T *k_ptr = k + (tk * nkvhead + kh) * d;
+                float dot = 0.f;
+                for (size_t i = 0; i < d; ++i) {
+                    dot += to_f32(q_ptr[i]) * to_f32(k_ptr[i]);
+                }
+                const float logit =
+                    dtype_round<T>(dtype_round<T>(dot) * scale);
+                const float probability = dtype_round<T>(
+                    std::exp(logit - max_logit) / denom);
+                const T *v_ptr = v + (tk * nkvhead + kh) * dv;
+                for (size_t j = 0; j < dv; ++j) {
+                    acc[j] += probability * to_f32(v_ptr[j]);
+                }
+            }
             for (size_t j = 0; j < dv; ++j) {
-                out[out_off + j] = from_f32<T>(acc[j] * inv_denom);
+                out[out_off + j] = from_f32<T>(acc[j]);
             }
         }
     }

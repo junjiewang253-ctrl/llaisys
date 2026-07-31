@@ -302,19 +302,20 @@ def test_swiglu(dtype_name):
 
 
 def attention_oracle(q, k, v, scale):
-    qf = q.float().transpose(0, 1)
-    kf = k.float().transpose(0, 1)
-    vf = v.float().transpose(0, 1)
+    qt = q.transpose(0, 1)
+    kt = k.transpose(0, 1)
+    vt = v.transpose(0, 1)
     length, source = q.shape[0], k.shape[0]
     repeat = q.shape[1] // k.shape[1]
-    kf = kf.repeat_interleave(repeat, 0)
-    vf = vf.repeat_interleave(repeat, 0)
-    scores = torch.matmul(qf, kf.transpose(-2, -1)) * scale
+    kt = kt.repeat_interleave(repeat, 0)
+    vt = vt.repeat_interleave(repeat, 0)
+    scores = torch.matmul(qt, kt.transpose(-2, -1)) * scale
     mask = torch.ones((length, source), dtype=torch.bool).tril(
         diagonal=source - length
     )
     scores.masked_fill_(~mask, float("-inf"))
-    return torch.matmul(torch.softmax(scores, -1), vf).transpose(0, 1)
+    probability = torch.softmax(scores, -1, dtype=torch.float32).to(q.dtype)
+    return torch.matmul(probability, vt).transpose(0, 1)
 
 
 def test_attention(dtype_name):
