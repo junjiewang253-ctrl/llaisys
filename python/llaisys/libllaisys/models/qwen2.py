@@ -38,6 +38,22 @@ class LlaisysQwen2Weights(ctypes.Structure):
         ("mlp_down_w", ctypes.POINTER(llaisysTensor_t)),
     ]
 
+class LlaisysQwen2Trace(ctypes.Structure):
+    _fields_ = [
+        ("embedding", llaisysTensor_t),
+        ("attention_out", ctypes.POINTER(llaisysTensor_t)),
+        ("layer_output", ctypes.POINTER(llaisysTensor_t)),
+        ("final_norm", llaisysTensor_t),
+        ("logits", llaisysTensor_t),
+        ("diagnostic_post_attention", llaisysTensor_t),
+        ("diagnostic_mlp_norm", llaisysTensor_t),
+        ("diagnostic_gate", llaisysTensor_t),
+        ("diagnostic_up", llaisysTensor_t),
+        ("diagnostic_activation", llaisysTensor_t),
+        ("diagnostic_mlp_out", llaisysTensor_t),
+        ("greedy_token", ctypes.c_int64),
+    ]
+
 LlaisysQwen2Model_p = ctypes.c_void_p
 
 lib.llaisysQwen2ModelCreate.restype = LlaisysQwen2Model_p
@@ -60,3 +76,6 @@ lib.llaisysQwen2ModelInfer.argtypes = [
     ctypes.POINTER(ctypes.c_int64),
     ctypes.c_size_t,
 ]
+
+lib.llaisysQwen2ModelTrace.restype = ctypes.POINTER(LlaisysQwen2Trace)
+lib.llaisysQwen2ModelTrace.argtypes = [LlaisysQwen2Model_p]

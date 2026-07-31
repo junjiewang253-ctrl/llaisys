@@ -14,9 +14,10 @@ except Exception as e:  # pragma: no cover
     torch = None
     _TORCH_IMPORT_ERROR = e
 
-from llaisys.libllaisys import LIB_LLAISYS as lib
+from llaisys.libllaisys import LIB_LLAISYS as lib, check_last_error
 from llaisys.libllaisys.models.qwen2 import (
     LlaisysQwen2Meta,
+    LlaisysQwen2Trace,
     LlaisysQwen2Weights,
     LlaisysQwen2Model_p,
 )
@@ -74,6 +75,8 @@ def _set_ctypes_signatures():
         ctypes.POINTER(ctypes.c_int64),
         ctypes.c_size_t,
     ]
+    lib.llaisysQwen2ModelTrace.restype = ctypes.POINTER(LlaisysQwen2Trace)
+    lib.llaisysQwen2ModelTrace.argtypes = [LlaisysQwen2Model_p]
 
 
 def _tensor_from_numpy(
@@ -161,6 +164,7 @@ class Qwen2Config:
     rms_norm_eps: float
     rope_theta: float
     eos_token_id: int
+    tie_word_embeddings: bool
 
 
 def _read_config(model_dir: str) -> Qwen2Config:
@@ -177,7 +181,58 @@ def _read_config(model_dir: str) -> Qwen2Config:
         rms_norm_eps=cfg.get("rms_norm_eps", 1e-6),
         rope_theta=float(cfg.get("rope_theta", 10000.0)),
         eos_token_id=int(cfg.get("eos_token_id", cfg.get("eos_token_ids", [0])[0])),
+        tie_word_embeddings=bool(cfg.get("tie_word_embeddings", False)),
     )
+
+
+def _expected_weight_shapes(cfg: Qwen2Config):
+    shapes = {
+        "model.embed_tokens.weight": (cfg.vocab_size, cfg.hidden_size),
+        "model.norm.weight": (cfg.hidden_size,),
+    }
+    if not cfg.tie_word_embeddings:
+        shapes["lm_head.weight"] = (cfg.vocab_size, cfg.hidden_size)
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    kv_size = cfg.num_key_value_heads * head_dim
+    for layer in range(cfg.num_hidden_layers):
+        prefix = f"model.layers.{layer}."
+        shapes.update(
+            {
+                prefix + "input_layernorm.weight": (cfg.hidden_size,),
+                prefix + "self_attn.q_proj.weight": (cfg.hidden_size, cfg.hidden_size),
+                prefix + "self_attn.q_proj.bias": (cfg.hidden_size,),
+                prefix + "self_attn.k_proj.weight": (kv_size, cfg.hidden_size),
+                prefix + "self_attn.k_proj.bias": (kv_size,),
+                prefix + "self_attn.v_proj.weight": (kv_size, cfg.hidden_size),
+                prefix + "self_attn.v_proj.bias": (kv_size,),
+                prefix + "self_attn.o_proj.weight": (cfg.hidden_size, cfg.hidden_size),
+                prefix + "post_attention_layernorm.weight": (cfg.hidden_size,),
+                prefix + "mlp.gate_proj.weight": (cfg.intermediate_size, cfg.hidden_size),
+                prefix + "mlp.up_proj.weight": (cfg.intermediate_size, cfg.hidden_size),
+                prefix + "mlp.down_proj.weight": (cfg.hidden_size, cfg.intermediate_size),
+            }
+        )
+    return shapes
+
+
+def _validate_weight_manifest(model_dir: str, cfg: Qwen2Config):
+    files = list(_iter_safetensors_files(model_dir))
+    if len(files) != 1:
+        raise ValueError(f"expected exactly one safetensors file, got {files}")
+    expected = _expected_weight_shapes(cfg)
+    with safe_open(files[0], framework="pt", device="cpu") as handle:
+        actual = set(handle.keys())
+        if actual != set(expected):
+            raise ValueError(
+                f"weight keys mismatch; missing={sorted(set(expected)-actual)}, "
+                f"extra={sorted(actual-set(expected))}"
+            )
+        for name, shape in expected.items():
+            tensor = handle.get_tensor(name)
+            if tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"weight shape mismatch for {name}: {tuple(tensor.shape)} != {shape}"
+                )
 
 
 def _infer_model_dtype_from_weights(model_dir: str, weight_map: Optional[Dict[str, str]]) -> int:
@@ -239,6 +294,11 @@ class Qwen2:
         self._wanted_dtype = wanted
 
         cfg = _read_config(model_dir)
+        if cfg.hidden_size % cfg.num_attention_heads != 0:
+            raise ValueError("hidden_size must be divisible by attention heads")
+        if cfg.num_attention_heads % cfg.num_key_value_heads != 0:
+            raise ValueError("attention heads must be divisible by KV heads")
+        _validate_weight_manifest(model_dir, cfg)
 
         meta = LlaisysQwen2Meta()
         meta.dtype = int(self._wanted_dtype)
@@ -256,10 +316,12 @@ class Qwen2:
 
         self.meta = meta
         self._model: LlaisysQwen2Model_p = lib.llaisysQwen2ModelCreate(ctypes.byref(meta), self.device, None, 0)
+        check_last_error()
         if not self._model:
             raise RuntimeError("llaisysQwen2ModelCreate failed")
 
         self._w_ptr = lib.llaisysQwen2ModelWeights(self._model)
+        check_last_error()
         if not self._w_ptr:
             raise RuntimeError("llaisysQwen2ModelWeights failed")
 
@@ -319,11 +381,69 @@ class Qwen2:
     def infer_next(self, token_ids: list[int]) -> int:
         arr = (ctypes.c_int64 * len(token_ids))(*token_ids)
         out = int(lib.llaisysQwen2ModelInfer(self._model, arr, len(token_ids)))
+        check_last_error()
         if out < 0:
             # 对齐 qwen2.cc 的错误码：
             # -1 bad args, -2 weights not ready, -3 too long, -4 no new token, -100 data null
             raise RuntimeError(f"llaisysQwen2ModelInfer failed: code={out}, ntoken={len(token_ids)}")
         return out
+
+    @staticmethod
+    def _trace_tensor(handle):
+        ndim = int(lib.tensorGetNdim(handle))
+        check_last_error()
+        shape_buffer = (ctypes.c_size_t * ndim)()
+        lib.tensorGetShape(handle, shape_buffer)
+        check_last_error()
+        shape = tuple(int(shape_buffer[i]) for i in range(ndim))
+        dtype_code = int(lib.tensorGetDataType(handle))
+        check_last_error()
+        torch_dtype = {
+            LLAISYS_DTYPE_F32: torch.float32,
+            LLAISYS_DTYPE_F16: torch.float16,
+            LLAISYS_DTYPE_BF16: torch.bfloat16,
+            LLAISYS_DTYPE_I64: torch.int64,
+        }[dtype_code]
+        result = torch.empty(shape, dtype=torch_dtype)
+        source = lib.tensorGetData(handle)
+        check_last_error()
+        ctypes.memmove(
+            result.data_ptr(), source, result.numel() * result.element_size()
+        )
+        return result
+
+    def forward_trace(self, token_ids):
+        tokens = _normalize_input_ids(token_ids)
+        greedy = self.infer_next(tokens)
+        pointer = lib.llaisysQwen2ModelTrace(self._model)
+        check_last_error()
+        if not pointer:
+            raise RuntimeError("Qwen2 trace is unavailable")
+        trace = pointer.contents
+        result = {
+            "embedding": self._trace_tensor(trace.embedding),
+            "final_norm": self._trace_tensor(trace.final_norm),
+            "logits": self._trace_tensor(trace.logits),
+            "greedy_token": int(trace.greedy_token),
+        }
+        for name in (
+            "diagnostic_post_attention",
+            "diagnostic_mlp_norm",
+            "diagnostic_gate",
+            "diagnostic_up",
+            "diagnostic_activation",
+            "diagnostic_mlp_out",
+        ):
+            result[name] = self._trace_tensor(getattr(trace, name))
+        for layer in range(int(self.meta.nlayer)):
+            result[f"layer.{layer}.attention_out"] = self._trace_tensor(
+                trace.attention_out[layer]
+            )
+            result[f"layer.{layer}.output"] = self._trace_tensor(
+                trace.layer_output[layer]
+            )
+        assert result["greedy_token"] == greedy
+        return result
 
     def generate(self, input_ids=None, **kwargs):
         """

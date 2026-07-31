@@ -31,6 +31,21 @@ __C {
 
     struct LlaisysQwen2Model;
 
+    struct LlaisysQwen2Trace {
+        llaisysTensor_t embedding;
+        llaisysTensor_t *attention_out;
+        llaisysTensor_t *layer_output;
+        llaisysTensor_t final_norm;
+        llaisysTensor_t logits;
+        llaisysTensor_t diagnostic_post_attention;
+        llaisysTensor_t diagnostic_mlp_norm;
+        llaisysTensor_t diagnostic_gate;
+        llaisysTensor_t diagnostic_up;
+        llaisysTensor_t diagnostic_activation;
+        llaisysTensor_t diagnostic_mlp_out;
+        int64_t greedy_token;
+    };
+
     __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice);
 
     __export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model * model);
@@ -38,5 +53,8 @@ __C {
     __export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model * model);
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
+
+    __export const struct LlaisysQwen2Trace *llaisysQwen2ModelTrace(
+        struct LlaisysQwen2Model *model);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

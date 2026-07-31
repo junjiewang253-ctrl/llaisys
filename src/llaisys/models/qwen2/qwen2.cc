@@ -1,14 +1,22 @@
 ﻿#include "llaisys/models/qwen2.h"
+#include "llaisys/error.h"
 #include "llaisys/ops.h"
 #include "llaisys/tensor.h"
 
+#include "../../../utils.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#undef __C
+#include <immintrin.h>
 #include <new>
+#include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -25,6 +33,7 @@ struct LlaisysQwen2Model {
     llaisysTensor_t *v_cache{nullptr}; // [maxseq, nkvh, dh]
     size_t cached_len{0};
     std::vector<int64_t> cached_tokens; // 用于判断前缀是否一致
+    LlaisysQwen2Trace trace{};
 };
 
 static int pick_device_id(const LlaisysQwen2Model *m) {
@@ -80,21 +89,6 @@ static void weights_alloc(LlaisysQwen2Model *model) {
     model->w.mlp_down_w = new llaisysTensor_t[L]();
 
     model->weights_inited = true;
-}
-
-static void kv_alloc(LlaisysQwen2Model *model) {
-    const size_t L = model->meta.nlayer;
-    model->k_cache = new llaisysTensor_t[L]();
-    model->v_cache = new llaisysTensor_t[L]();
-
-    const int devid = pick_device_id(model);
-    for (size_t i = 0; i < L; ++i) {
-        size_t shape[3]{model->meta.maxseq, model->meta.nkvh, model->meta.dh};
-        model->k_cache[i] = tensorCreate(shape, 3, model->meta.dtype, model->device, devid);
-        model->v_cache[i] = tensorCreate(shape, 3, model->meta.dtype, model->device, devid);
-    }
-    model->cached_len = 0;
-    model->cached_tokens.clear();
 }
 
 static void kv_free(LlaisysQwen2Model *model) {
@@ -238,9 +232,155 @@ static llaisysTensor_t make_tensor_3d(size_t a, size_t b, size_t c, llaisysDataT
     return tensorCreate(shape, 3, dt, dev, devid);
 }
 
-static void reset_cache(LlaisysQwen2Model *m) {
-    m->cached_len = 0;
-    m->cached_tokens.clear();
+static void trace_clear(LlaisysQwen2Model *model) {
+    if (!model) {
+        return;
+    }
+    tensorDestroy(model->trace.embedding);
+    tensorDestroy(model->trace.final_norm);
+    tensorDestroy(model->trace.logits);
+    tensorDestroy(model->trace.diagnostic_post_attention);
+    tensorDestroy(model->trace.diagnostic_mlp_norm);
+    tensorDestroy(model->trace.diagnostic_gate);
+    tensorDestroy(model->trace.diagnostic_up);
+    tensorDestroy(model->trace.diagnostic_activation);
+    tensorDestroy(model->trace.diagnostic_mlp_out);
+    if (model->trace.attention_out) {
+        for (size_t i = 0; i < model->meta.nlayer; ++i) {
+            tensorDestroy(model->trace.attention_out[i]);
+        }
+        delete[] model->trace.attention_out;
+    }
+    if (model->trace.layer_output) {
+        for (size_t i = 0; i < model->meta.nlayer; ++i) {
+            tensorDestroy(model->trace.layer_output[i]);
+        }
+        delete[] model->trace.layer_output;
+    }
+    model->trace = LlaisysQwen2Trace{};
+}
+
+static llaisysTensor_t trace_copy(llaisysTensor_t tensor) {
+    auto result = tensorContiguous(tensor);
+    if (!result || llaisysGetLastErrorCode() != LLAISYS_STATUS_SUCCESS) {
+        throw std::runtime_error("failed to capture Qwen2 trace tensor");
+    }
+    return result;
+}
+
+static void require_op_success(const char *stage) {
+    if (llaisysGetLastErrorCode() != LLAISYS_STATUS_SUCCESS) {
+        const char *message = llaisysGetLastErrorMessage();
+        throw std::runtime_error(
+            std::string(stage) + ": " + (message ? message : "unknown error"));
+    }
+}
+
+static void qwen2_rope_bf16(llaisysTensor_t out,
+                            llaisysTensor_t input,
+                            llaisysTensor_t positions,
+                            float theta,
+                            size_t sequence,
+                            size_t heads,
+                            size_t dimension) {
+    auto *destination =
+        reinterpret_cast<llaisys::bf16_t *>(tensorGetData(out));
+    const auto *source =
+        reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(input));
+    const auto *position =
+        reinterpret_cast<const int64_t *>(tensorGetData(positions));
+    const size_t half = dimension / 2;
+    for (size_t s = 0; s < sequence; ++s) {
+        for (size_t d = 0; d < half; ++d) {
+            const float frequency =
+                static_cast<float>(position[s]) /
+                std::pow(theta, 2.0f * static_cast<float>(d) /
+                                    static_cast<float>(dimension));
+            const auto cosine =
+                llaisys::utils::cast<llaisys::bf16_t>(std::cos(frequency));
+            const auto sine =
+                llaisys::utils::cast<llaisys::bf16_t>(std::sin(frequency));
+            const float c = llaisys::utils::cast<float>(cosine);
+            const float sn = llaisys::utils::cast<float>(sine);
+            for (size_t h = 0; h < heads; ++h) {
+                const size_t left = (s * heads + h) * dimension + d;
+                const size_t right = left + half;
+                const float x1 = llaisys::utils::cast<float>(source[left]);
+                const float x2 = llaisys::utils::cast<float>(source[right]);
+                const auto left_cos =
+                    llaisys::utils::cast<llaisys::bf16_t>(x1 * c);
+                const auto right_sin =
+                    llaisys::utils::cast<llaisys::bf16_t>(x2 * sn);
+                const auto right_cos =
+                    llaisys::utils::cast<llaisys::bf16_t>(x2 * c);
+                const auto left_sin =
+                    llaisys::utils::cast<llaisys::bf16_t>(x1 * sn);
+                destination[left] = llaisys::utils::cast<llaisys::bf16_t>(
+                    llaisys::utils::cast<float>(left_cos) -
+                    llaisys::utils::cast<float>(right_sin));
+                destination[right] = llaisys::utils::cast<llaisys::bf16_t>(
+                    llaisys::utils::cast<float>(right_cos) +
+                    llaisys::utils::cast<float>(left_sin));
+            }
+        }
+    }
+}
+
+__attribute__((target("avx512f,avx512dq,avx512vl,fma")))
+static void qwen2_linear_bf16(llaisysTensor_t out,
+                              llaisysTensor_t input,
+                              llaisysTensor_t weight,
+                              llaisysTensor_t bias,
+                              size_t rows,
+                              size_t input_size,
+                              size_t output_size) {
+    auto *destination =
+        reinterpret_cast<llaisys::bf16_t *>(tensorGetData(out));
+    const auto *source =
+        reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(input));
+    const auto *matrix =
+        reinterpret_cast<const llaisys::bf16_t *>(tensorGetData(weight));
+    for (size_t row = 0; row < rows; ++row) {
+        for (size_t output_index = 0; output_index < output_size;
+             ++output_index) {
+            const auto *source_row = source + row * input_size;
+            const auto *matrix_row = matrix + output_index * input_size;
+            __m512 accumulator = _mm512_setzero_ps();
+            size_t input_index = 0;
+            for (; input_index + 16 <= input_size; input_index += 16) {
+                const __m256i source16 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(
+                        source_row + input_index));
+                const __m256i matrix16 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(
+                        matrix_row + input_index));
+                const __m512 source32 = _mm512_castsi512_ps(
+                    _mm512_slli_epi32(
+                        _mm512_cvtepu16_epi32(source16), 16));
+                const __m512 matrix32 = _mm512_castsi512_ps(
+                    _mm512_slli_epi32(
+                        _mm512_cvtepu16_epi32(matrix16), 16));
+                accumulator =
+                    _mm512_fmadd_ps(source32, matrix32, accumulator);
+            }
+            float sum = _mm512_reduce_add_ps(accumulator);
+            if (input_index < input_size) {
+                for (; input_index < input_size; ++input_index) {
+                    sum += llaisys::utils::cast<float>(
+                               source_row[input_index]) *
+                           llaisys::utils::cast<float>(
+                               matrix_row[input_index]);
+                }
+            }
+            if (bias) {
+                sum += llaisys::utils::cast<float>(
+                    reinterpret_cast<const llaisys::bf16_t *>(
+                        tensorGetData(bias))[output_index]);
+            }
+            destination[row * output_size + output_index] =
+                llaisys::utils::cast<llaisys::bf16_t>(sum);
+        }
+    }
 }
 
 extern "C" {
@@ -267,7 +407,6 @@ __export LlaisysQwen2Model *llaisysQwen2ModelCreate(
     }
 
     weights_alloc(m);
-    kv_alloc(m);
     return m;
 }
 
@@ -275,9 +414,15 @@ __export void llaisysQwen2ModelDestroy(LlaisysQwen2Model *model) {
     if (!model) {
         return;
     }
+    trace_clear(model);
     kv_free(model);
     weights_free_and_destroy_tensors(model);
     delete model;
+}
+
+__export const LlaisysQwen2Trace *
+llaisysQwen2ModelTrace(LlaisysQwen2Model *model) {
+    return model ? &model->trace : nullptr;
 }
 
 __export LlaisysQwen2Weights *llaisysQwen2ModelWeights(LlaisysQwen2Model *model) {
@@ -291,7 +436,6 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
     // ---- switches ----
     static const bool DEBUG_LAYERS = false;   // 逐层日志（默认关）
     static const bool STAGE_MARKS = false;     // 阶段打点（默认开，用于定位卡住）
-    static const bool ENABLE_KV_WRITE = true; // KV cache 写入（默认开；卡住就先改 false 验证）
     static const bool FORCE_DV_EQ_D = false;  // 仅用于定位（默认关）
 
     auto MARK = [&](const char *msg) {
@@ -354,6 +498,26 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
 
         const auto &meta = model->meta;
         const int devid = pick_device_id(model);
+        auto linear = [&](llaisysTensor_t out,
+                          llaisysTensor_t input,
+                          llaisysTensor_t weight,
+                          llaisysTensor_t bias,
+                          size_t rows,
+                          size_t input_size,
+                          size_t output_size) {
+            if (model->device == LLAISYS_DEVICE_CPU &&
+                meta.dtype == LLAISYS_DTYPE_BF16) {
+                qwen2_linear_bf16(
+                    out, input, weight, bias,
+                    rows, input_size, output_size);
+            } else {
+                llaisysLinear(out, input, weight, bias);
+                require_op_success("linear");
+            }
+        };
+        trace_clear(model);
+        model->trace.attention_out = new llaisysTensor_t[meta.nlayer]();
+        model->trace.layer_output = new llaisysTensor_t[meta.nlayer]();
 
         std::fprintf(stderr,
                      "[infer] device=%d devid=%d ntoken=%zu cached_len=%zu dtype=%d nlayer=%zu hs=%zu nh=%zu nkvh=%zu dh=%zu di=%zu voc=%zu maxseq=%zu\n",
@@ -361,26 +525,9 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
                      meta.nkvh, meta.dh, meta.di, meta.voc, meta.maxseq);
         std::fflush(stderr);
 
-        // ---------- decide incremental ----------
-        size_t start = 0;
-        if (model->cached_len > 0 && ntoken >= model->cached_len) {
-            bool prefix_ok = true;
-            for (size_t i = 0; i < model->cached_len; ++i) {
-                if (i >= model->cached_tokens.size() || model->cached_tokens[i] != token_ids[i]) {
-                    prefix_ok = false;
-                    break;
-                }
-            }
-            if (prefix_ok) {
-                start = model->cached_len;
-            }
-        }
-        if (start == 0 && model->cached_len != 0) {
-            MARK("prefix mismatch -> reset_cache");
-            reset_cache(model);
-        }
-
-        const size_t new_len = ntoken - start;
+        // M4 contract: every invocation recomputes the complete prefix.
+        const size_t start = 0;
+        const size_t new_len = ntoken;
         std::fprintf(stderr, "[infer] start=%zu new_len=%zu\n", start, new_len);
         std::fflush(stderr);
         if (new_len == 0) {
@@ -407,6 +554,8 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
         MARK("embedding");
         TensorGuard x(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
         llaisysEmbedding(x.t, t_tok.t, model->w.in_embed);
+        require_op_success("embedding");
+        model->trace.embedding = trace_copy(x.t);
 
         MARK("before blocks");
 
@@ -419,6 +568,7 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             }
             TensorGuard xn(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
             llaisysRmsNorm(xn.t, x.t, model->w.attn_norm_w[l], meta.epsilon);
+            require_op_success("input RMSNorm");
 
             if (l == 0) {
                 MARK("L0: qkv linear");
@@ -426,9 +576,15 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             TensorGuard q2(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
             TensorGuard k2(make_tensor_2d(new_len, meta.nkvh * meta.dh, meta.dtype, model->device, devid));
             TensorGuard v2(make_tensor_2d(new_len, meta.nkvh * meta.dh, meta.dtype, model->device, devid));
-            llaisysLinear(q2.t, xn.t, model->w.attn_q_w[l], model->w.attn_q_b ? model->w.attn_q_b[l] : nullptr);
-            llaisysLinear(k2.t, xn.t, model->w.attn_k_w[l], model->w.attn_k_b ? model->w.attn_k_b[l] : nullptr);
-            llaisysLinear(v2.t, xn.t, model->w.attn_v_w[l], model->w.attn_v_b ? model->w.attn_v_b[l] : nullptr);
+            linear(q2.t, xn.t, model->w.attn_q_w[l],
+                   model->w.attn_q_b ? model->w.attn_q_b[l] : nullptr,
+                   new_len, meta.hs, meta.hs);
+            linear(k2.t, xn.t, model->w.attn_k_w[l],
+                   model->w.attn_k_b ? model->w.attn_k_b[l] : nullptr,
+                   new_len, meta.hs, meta.nkvh * meta.dh);
+            linear(v2.t, xn.t, model->w.attn_v_w[l],
+                   model->w.attn_v_b ? model->w.attn_v_b[l] : nullptr,
+                   new_len, meta.hs, meta.nkvh * meta.dh);
 
             MARK_L(l, "view qkv -> 3d");
             size_t qshape[3]{new_len, meta.nh, meta.dh};
@@ -442,24 +598,19 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             }
             TensorGuard q_rope(make_tensor_3d(new_len, meta.nh, meta.dh, meta.dtype, model->device, devid));
             TensorGuard k_rope(make_tensor_3d(new_len, meta.nkvh, meta.dh, meta.dtype, model->device, devid));
-            llaisysROPE(q_rope.t, q3.t, t_pos.t, meta.theta);
-            llaisysROPE(k_rope.t, k3.t, t_pos.t, meta.theta);
-
-            if (ENABLE_KV_WRITE) {
-                if (l == 0) {
-                    MARK("L0: write kv cache");
-                }
-                TensorGuard k_dst(tensorSlice(model->k_cache[l], 0, start, start + new_len));
-                TensorGuard v_dst(tensorSlice(model->v_cache[l], 0, start, start + new_len));
-                llaisysRearrange(k_dst.t, k_rope.t);
-                llaisysRearrange(v_dst.t, v3.t);
+            if (model->device == LLAISYS_DEVICE_CPU &&
+                meta.dtype == LLAISYS_DTYPE_BF16) {
+                qwen2_rope_bf16(
+                    q_rope.t, q3.t, t_pos.t, meta.theta,
+                    new_len, meta.nh, meta.dh);
+                qwen2_rope_bf16(
+                    k_rope.t, k3.t, t_pos.t, meta.theta,
+                    new_len, meta.nkvh, meta.dh);
+            } else {
+                llaisysROPE(q_rope.t, q3.t, t_pos.t, meta.theta);
+                llaisysROPE(k_rope.t, k3.t, t_pos.t, meta.theta);
+                require_op_success("RoPE");
             }
-
-            if (l == 0) {
-                MARK("L0: k/v total slice");
-            }
-            TensorGuard k_total(tensorSlice(model->k_cache[l], 0, 0, start + new_len));
-            TensorGuard v_total(tensorSlice(model->v_cache[l], 0, 0, start + new_len));
 
             if (l == 0) {
                 MARK("L0: self_attention");
@@ -471,12 +622,13 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             TensorGuard attn_val(make_tensor_3d(new_len, meta.nh, dv, meta.dtype, model->device, devid));
             if (l == 0) {
                 dump_shape("q_rope", q_rope.t);
-                dump_shape("k_total", k_total.t);
-                dump_shape("v_total", v_total.t);
+                dump_shape("k_total", k_rope.t);
+                dump_shape("v_total", v3.t);
                 dump_shape("attn_val(out, pre)", attn_val.t);
             }
 
-            llaisysSelfAttention(attn_val.t, q_rope.t, k_total.t, v_total.t, attn_scale);
+            llaisysSelfAttention(attn_val.t, q_rope.t, k_rope.t, v3.t, attn_scale);
+            require_op_success("self attention");
 
             if (l == 0) {
                 dump_shape("attn_val(out, post)", attn_val.t);
@@ -490,33 +642,56 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
                 MARK("L0: attn out linear");
             }
             TensorGuard attn_out(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
-            llaisysLinear(attn_out.t, attn_2d.t, model->w.attn_o_w[l], nullptr);
+            linear(attn_out.t, attn_2d.t, model->w.attn_o_w[l], nullptr,
+                   new_len, meta.hs, meta.hs);
+            model->trace.attention_out[l] = trace_copy(attn_out.t);
 
             MARK_L(l, "residual add 1");
             TensorGuard x1(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
             llaisysAdd(x1.t, x.t, attn_out.t);
+            if (l == 0) {
+                model->trace.diagnostic_post_attention = trace_copy(x1.t);
+            }
 
             if (l == 0) {
                 MARK("L0: mlp");
             }
             TensorGuard x1n(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
             llaisysRmsNorm(x1n.t, x1.t, model->w.mlp_norm_w[l], meta.epsilon);
+            if (l == 0) {
+                model->trace.diagnostic_mlp_norm = trace_copy(x1n.t);
+            }
 
             TensorGuard gate(make_tensor_2d(new_len, meta.di, meta.dtype, model->device, devid));
             TensorGuard up(make_tensor_2d(new_len, meta.di, meta.dtype, model->device, devid));
-            llaisysLinear(gate.t, x1n.t, model->w.mlp_gate_w[l], nullptr);
-            llaisysLinear(up.t, x1n.t, model->w.mlp_up_w[l], nullptr);
+            linear(gate.t, x1n.t, model->w.mlp_gate_w[l], nullptr,
+                   new_len, meta.hs, meta.di);
+            linear(up.t, x1n.t, model->w.mlp_up_w[l], nullptr,
+                   new_len, meta.hs, meta.di);
+            if (l == 0) {
+                model->trace.diagnostic_gate = trace_copy(gate.t);
+                model->trace.diagnostic_up = trace_copy(up.t);
+            }
 
             TensorGuard act(make_tensor_2d(new_len, meta.di, meta.dtype, model->device, devid));
             llaisysSwiGLU(act.t, gate.t, up.t);
+            if (l == 0) {
+                model->trace.diagnostic_activation = trace_copy(act.t);
+            }
 
             TensorGuard mlp_out(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
-            llaisysLinear(mlp_out.t, act.t, model->w.mlp_down_w[l], nullptr);
+            linear(mlp_out.t, act.t, model->w.mlp_down_w[l], nullptr,
+                   new_len, meta.di, meta.hs);
+            if (l == 0) {
+                model->trace.diagnostic_mlp_out = trace_copy(mlp_out.t);
+            }
 
             TensorGuard x2(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
             llaisysAdd(x2.t, x1.t, mlp_out.t);
+            require_op_success("MLP residual");
 
             x = std::move(x2);
+            model->trace.layer_output[l] = trace_copy(x.t);
             MARK_L(l, "end");
         }
 
@@ -525,10 +700,14 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
         MARK("final norm");
         TensorGuard xnorm(make_tensor_2d(new_len, meta.hs, meta.dtype, model->device, devid));
         llaisysRmsNorm(xnorm.t, x.t, model->w.out_norm_w, meta.epsilon);
+        require_op_success("final RMSNorm");
+        model->trace.final_norm = trace_copy(xnorm.t);
 
         MARK("logits linear");
         TensorGuard logits(make_tensor_2d(new_len, meta.voc, meta.dtype, model->device, devid));
-        llaisysLinear(logits.t, xnorm.t, model->w.out_embed, nullptr);
+        linear(logits.t, xnorm.t, model->w.out_embed, nullptr,
+               new_len, meta.hs, meta.voc);
+        model->trace.logits = trace_copy(logits.t);
 
         MARK("last row slice + view");
         TensorGuard last2d(tensorSlice(logits.t, 0, new_len - 1, new_len));
@@ -546,10 +725,7 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             return -100;
         }
         int64_t out = *reinterpret_cast<int64_t *>(p);
-
-        MARK("update cache");
-        model->cached_len = ntoken;
-        model->cached_tokens.assign(token_ids, token_ids + ntoken);
+        model->trace.greedy_token = out;
 
         std::fprintf(stderr, "[infer] return token=%lld\n", (long long)out);
         std::fflush(stderr);
