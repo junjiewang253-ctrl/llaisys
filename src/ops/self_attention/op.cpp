@@ -5,6 +5,8 @@
 
 #include "cpu/self_attention_cpu.hpp"
 
+#include <cmath>
+
 namespace llaisys::ops {
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
     CHECK_SAME_DEVICE(attn_val, q, k, v);
@@ -32,6 +34,11 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
     const size_t nkvhead_v = v->shape()[1];
     const size_t dv = v->shape()[2];
 
+    CHECK_ARGUMENT(total_len >= seqlen, "self_attention: require S >= L.");
+    CHECK_ARGUMENT(nhead > 0 && d > 0 && dv > 0,
+                   "self_attention: head dimensions must be positive.");
+    CHECK_ARGUMENT(std::isfinite(scale) && scale > 0.0f,
+                   "self_attention: scale must be finite and positive.");
     ASSERT(d_k == d, "self_attention: k last dim must equal q last dim.");
     ASSERT(total_len_v == total_len, "self_attention: v total_len must equal k total_len.");
     ASSERT(nkvhead_v == nkvhead, "self_attention: v nkvhead must equal k nkvhead.");

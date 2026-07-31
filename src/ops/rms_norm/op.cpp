@@ -7,6 +7,7 @@
 
 namespace llaisys::ops {
 void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps) {
+    CHECK_ARGUMENT(eps > 0.0f, "RMSNorm: eps must be positive.");
     // 1) 设备与 dtype 检查：三者必须在同一设备 & dtype 相同
     CHECK_SAME_DEVICE(out, in, weight);
     CHECK_SAME_DTYPE(out->dtype(), in->dtype(), weight->dtype());

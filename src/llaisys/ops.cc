@@ -1,5 +1,6 @@
 #include "llaisys/ops.h"
 
+#include "error.hpp"
 #include "llaisys_tensor.hpp"
 
 #include "../ops/add/op.hpp"
@@ -12,90 +13,126 @@
 #include "../ops/self_attention/op.hpp"
 #include "../ops/swiglu/op.hpp"
 
-#include <cstdio>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+llaisys::tensor_t requireTensor(llaisysTensor_t tensor, const char *name) {
+    if (tensor == nullptr || !tensor->tensor) {
+        throw std::invalid_argument(std::string(name) + " tensor is null");
+    }
+    return tensor->tensor;
+}
+
+} // namespace
 
 __C {
 
-    void llaisysAdd(llaisysTensor_t c, llaisysTensor_t a, llaisysTensor_t b) {
-        if (!c || !a || !b) {
-            std::fprintf(stderr, "[llaisys] llaisysAdd: nullptr arg(s): c=%p a=%p b=%p\n", (void *)c, (void *)a, (void *)b);
-            return;
-        }
-        llaisys::ops::add(c->tensor, a->tensor, b->tensor);
-    }
+void llaisysAdd(llaisysTensor_t out,
+                llaisysTensor_t lhs,
+                llaisysTensor_t rhs) {
+    llaisys::capi::guardVoid([&] {
+        llaisys::ops::add(
+            requireTensor(out, "out"),
+            requireTensor(lhs, "lhs"),
+            requireTensor(rhs, "rhs"));
+    });
+}
 
-    void llaisysArgmax(llaisysTensor_t max_idx, llaisysTensor_t max_val, llaisysTensor_t vals) {
-        if (!max_idx || !max_val || !vals) {
-            std::fprintf(stderr, "[llaisys] llaisysArgmax: nullptr arg(s): max_idx=%p max_val=%p vals=%p\n",
-                         (void *)max_idx, (void *)max_val, (void *)vals);
-            return;
-        }
-        std::fprintf(stderr, "[llaisys] reached llaisysArgmax UNIQUE=20260127_001\n");
-        llaisys::ops::argmax(max_idx->tensor, max_val->tensor, vals->tensor);
-    }
+void llaisysArgmax(llaisysTensor_t max_idx,
+                   llaisysTensor_t max_val,
+                   llaisysTensor_t values) {
+    llaisys::capi::guardVoid([&] {
+        llaisys::ops::argmax(
+            requireTensor(max_idx, "max_idx"),
+            requireTensor(max_val, "max_val"),
+            requireTensor(values, "values"));
+    });
+}
 
-    void llaisysEmbedding(llaisysTensor_t out, llaisysTensor_t index, llaisysTensor_t weight) {
-        if (!out || !index || !weight) {
-            std::fprintf(stderr, "[llaisys] llaisysEmbedding: nullptr arg(s): out=%p index=%p weight=%p\n",
-                         (void *)out, (void *)index, (void *)weight);
-            return;
-        }
-        llaisys::ops::embedding(out->tensor, index->tensor, weight->tensor);
-    }
+void llaisysEmbedding(llaisysTensor_t out,
+                      llaisysTensor_t index,
+                      llaisysTensor_t weight) {
+    llaisys::capi::guardVoid([&] {
+        llaisys::ops::embedding(
+            requireTensor(out, "out"),
+            requireTensor(index, "index"),
+            requireTensor(weight, "weight"));
+    });
+}
 
-    void llaisysLinear(llaisysTensor_t out, llaisysTensor_t in, llaisysTensor_t weight, llaisysTensor_t bias) {
-        if (!out || !in || !weight) {
-            std::fprintf(stderr, "[llaisys] llaisysLinear: nullptr arg(s): out=%p in=%p weight=%p bias=%p\n",
-                         (void *)out, (void *)in, (void *)weight, (void *)bias);
-            return;
-        }
-        // bias is optional
-        llaisys::tensor_t bias_t = bias ? bias->tensor : llaisys::tensor_t{};
-        llaisys::ops::linear(out->tensor, in->tensor, weight->tensor, bias_t);
-    }
+void llaisysLinear(llaisysTensor_t out,
+                   llaisysTensor_t input,
+                   llaisysTensor_t weight,
+                   llaisysTensor_t bias) {
+    llaisys::capi::guardVoid([&] {
+        llaisys::ops::linear(
+            requireTensor(out, "out"),
+            requireTensor(input, "input"),
+            requireTensor(weight, "weight"),
+            bias == nullptr ? llaisys::tensor_t{}
+                            : requireTensor(bias, "bias"));
+    });
+}
 
-    void llaisysRearrange(llaisysTensor_t out, llaisysTensor_t in) {
-        if (!out || !in) {
-            std::fprintf(stderr, "[llaisys] llaisysRearrange: nullptr arg(s): out=%p in=%p\n", (void *)out, (void *)in);
-            return;
-        }
-        llaisys::ops::rearrange(out->tensor, in->tensor);
-    }
+void llaisysRearrange(llaisysTensor_t out, llaisysTensor_t input) {
+    llaisys::capi::guardVoid([&] {
+        llaisys::ops::rearrange(
+            requireTensor(out, "out"), requireTensor(input, "input"));
+    });
+}
 
-    void llaisysRmsNorm(llaisysTensor_t out, llaisysTensor_t in, llaisysTensor_t weight, float eps) {
-        if (!out || !in || !weight) {
-            std::fprintf(stderr, "[llaisys] llaisysRmsNorm: nullptr arg(s): out=%p in=%p weight=%p\n",
-                         (void *)out, (void *)in, (void *)weight);
-            return;
-        }
-        llaisys::ops::rms_norm(out->tensor, in->tensor, weight->tensor, eps);
-    }
+void llaisysRmsNorm(llaisysTensor_t out,
+                    llaisysTensor_t input,
+                    llaisysTensor_t weight,
+                    float eps) {
+    llaisys::capi::guardVoid([&] {
+        llaisys::ops::rms_norm(
+            requireTensor(out, "out"),
+            requireTensor(input, "input"),
+            requireTensor(weight, "weight"),
+            eps);
+    });
+}
 
-    void llaisysROPE(llaisysTensor_t out, llaisysTensor_t in, llaisysTensor_t pos_ids, float theta) {
-        if (!out || !in || !pos_ids) {
-            std::fprintf(stderr, "[llaisys] llaisysROPE: nullptr arg(s): out=%p in=%p pos_ids=%p\n",
-                         (void *)out, (void *)in, (void *)pos_ids);
-            return;
-        }
-        llaisys::ops::rope(out->tensor, in->tensor, pos_ids->tensor, theta);
-    }
+void llaisysROPE(llaisysTensor_t out,
+                 llaisysTensor_t input,
+                 llaisysTensor_t pos_ids,
+                 float theta) {
+    llaisys::capi::guardVoid([&] {
+        llaisys::ops::rope(
+            requireTensor(out, "out"),
+            requireTensor(input, "input"),
+            requireTensor(pos_ids, "pos_ids"),
+            theta);
+    });
+}
 
-    void llaisysSelfAttention(llaisysTensor_t attn_val, llaisysTensor_t q, llaisysTensor_t k, llaisysTensor_t v, float scale) {
-        if (!attn_val || !q || !k || !v) {
-            std::fprintf(stderr, "[llaisys] llaisysSelfAttention: nullptr arg(s): attn_val=%p q=%p k=%p v=%p\n",
-                         (void *)attn_val, (void *)q, (void *)k, (void *)v);
-            return;
-        }
-        llaisys::ops::self_attention(attn_val->tensor, q->tensor, k->tensor, v->tensor, scale);
-    }
+void llaisysSelfAttention(llaisysTensor_t out,
+                          llaisysTensor_t q,
+                          llaisysTensor_t k,
+                          llaisysTensor_t v,
+                          float scale) {
+    llaisys::capi::guardVoid([&] {
+        llaisys::ops::self_attention(
+            requireTensor(out, "out"),
+            requireTensor(q, "q"),
+            requireTensor(k, "k"),
+            requireTensor(v, "v"),
+            scale);
+    });
+}
 
-    void llaisysSwiGLU(llaisysTensor_t out, llaisysTensor_t gate, llaisysTensor_t up) {
-        if (!out || !gate || !up) {
-            std::fprintf(stderr, "[llaisys] llaisysSwiGLU: nullptr arg(s): out=%p gate=%p up=%p\n",
-                         (void *)out, (void *)gate, (void *)up);
-            return;
-        }
-        llaisys::ops::swiglu(out->tensor, gate->tensor, up->tensor);
-    }
+void llaisysSwiGLU(llaisysTensor_t out,
+                   llaisysTensor_t gate,
+                   llaisysTensor_t up) {
+    llaisys::capi::guardVoid([&] {
+        llaisys::ops::swiglu(
+            requireTensor(out, "out"),
+            requireTensor(gate, "gate"),
+            requireTensor(up, "up"));
+    });
+}
 
-} // __C
+}

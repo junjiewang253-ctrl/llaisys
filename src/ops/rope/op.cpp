@@ -7,6 +7,7 @@
 
 namespace llaisys::ops {
 void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
+    CHECK_ARGUMENT(theta > 0.0f, "RoPE: theta must be positive.");
     // 保证 out/in/pos_ids 在同一设备上（避免 CPU 读 GPU 指针等错误）
     CHECK_SAME_DEVICE(out, in, pos_ids);
 
@@ -29,7 +30,7 @@ void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
     const size_t d = s[2];
 
     // d 必须为偶数，才能拆成 [a, b] 两半做旋转
-    ASSERT(d % 2 == 0, "RoPE: last dim d must be even.");
+    ASSERT(d > 0 && d % 2 == 0, "RoPE: last dim d must be positive and even.");
 
     // pos_ids 形状必须是 [seqlen]
     ASSERT(pos_ids->shape().size() == 1 && pos_ids->shape()[0] == seqlen,

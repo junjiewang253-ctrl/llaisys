@@ -18,7 +18,13 @@ static void rearrange_strided_impl(
     size_t ndim) {
 
     if (ndim == 0) {
+        out[0] = in[0];
         return;
+    }
+    for (size_t dim = 0; dim < ndim; ++dim) {
+        if (shape[dim] == 0) {
+            return;
+        }
     }
 
     // 维护一个 ndim 维的 index
