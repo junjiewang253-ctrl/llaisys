@@ -216,7 +216,7 @@ def test_linear(dtype_name):
 
 def test_rms_norm(dtype_name):
     dtype = DTYPES[dtype_name][0]
-    cases = [(1, 1), (2, 4), (3, 31), (2, 896)]
+    cases = [(1, 1), (2, 4), (3, 31), (2, 896), (1, 896)]
     rng = random.Random(SEED)
     cases.extend(
         (rng.randint(1, 4), rng.randint(1, 32)) for _ in range(16)
@@ -226,7 +226,9 @@ def test_rms_norm(dtype_name):
             if index == 0:
                 inp = torch.zeros(shape, dtype=dtype)
             elif shape[-1] == 896:
-                generator = torch.Generator().manual_seed(8)
+                generator = torch.Generator().manual_seed(
+                    8 if shape[0] == 2 else 92
+                )
                 inp = torch.randn(shape, generator=generator).to(dtype)
             else:
                 inp = deterministic_values(shape, dtype, 0.0625)

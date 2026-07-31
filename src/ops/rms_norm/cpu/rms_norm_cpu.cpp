@@ -35,38 +35,102 @@ inline T from_f32(float v) {
     }
 }
 
-__attribute__((target("avx512f,avx512dq,avx512vl,fma")))
-float bf16_sum_squares_avx512(
+__attribute__((target("avx2,fma")))
+__m256 load_bf16_square_avx2(
+    const llaisys::bf16_t *values, size_t vector_index) {
+    constexpr size_t vector_width = 8;
+    const __m128i packed = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(
+            values + vector_index * vector_width));
+    const __m256 floats = _mm256_castsi256_ps(
+        _mm256_slli_epi32(
+            _mm256_cvtepu16_epi32(packed), 16));
+    return _mm256_mul_ps(floats, floats);
+}
+
+__attribute__((target("avx2,fma")))
+float bf16_sum_squares_avx2(
     const llaisys::bf16_t *values, size_t count) {
-    __m512 accumulators[4]{
-        _mm512_setzero_ps(), _mm512_setzero_ps(),
-        _mm512_setzero_ps(), _mm512_setzero_ps()};
-    size_t index = 0;
-    for (; index + 64 <= count; index += 64) {
-        for (size_t lane = 0; lane < 4; ++lane) {
-            const __m256i packed = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i *>(
-                    values + index + lane * 16));
-            const __m512 floats = _mm512_castsi512_ps(
-                _mm512_slli_epi32(
-                    _mm512_cvtepu16_epi32(packed), 16));
-            accumulators[lane] = _mm512_add_ps(
-                accumulators[lane], _mm512_mul_ps(floats, floats));
+    constexpr size_t vector_width = 8;
+    constexpr size_t ilp_factor = 4;
+    constexpr size_t levels_count = 4;
+    __m256 levels[levels_count][ilp_factor];
+    for (size_t level = 0; level < levels_count; ++level) {
+        for (size_t partial = 0; partial < ilp_factor; ++partial) {
+            levels[level][partial] = _mm256_setzero_ps();
         }
     }
-    __m512 accumulator = _mm512_add_ps(
-        accumulators[0], accumulators[1]);
-    accumulator = _mm512_add_ps(accumulator, accumulators[2]);
-    accumulator = _mm512_add_ps(accumulator, accumulators[3]);
-    alignas(64) float lanes[16];
-    _mm512_store_ps(lanes, accumulator);
-    float result = 0.0f;
-    for (size_t lane = 0; lane < 16; ++lane) {
-        result += lanes[lane];
+
+    const size_t vector_count = count / vector_width;
+    const size_t group_count = vector_count / ilp_factor;
+    size_t ceil_log2 = 0;
+    for (size_t value = group_count > 0 ? group_count - 1 : 0;
+         value > 0; value >>= 1) {
+        ++ceil_log2;
     }
+    const size_t level_power = std::max<size_t>(
+        4, ceil_log2 / levels_count);
+    const size_t level_step = size_t{1} << level_power;
+    const size_t level_mask = level_step - 1;
+    size_t group = 0;
+    while (group + level_step <= group_count) {
+        for (size_t item = 0; item < level_step; ++item, ++group) {
+            for (size_t partial = 0; partial < ilp_factor; ++partial) {
+                levels[0][partial] = _mm256_add_ps(
+                    levels[0][partial],
+                    load_bf16_square_avx2(
+                        values, group * ilp_factor + partial));
+            }
+        }
+        for (size_t level = 1; level < levels_count; ++level) {
+            for (size_t partial = 0; partial < ilp_factor; ++partial) {
+                levels[level][partial] = _mm256_add_ps(
+                    levels[level][partial],
+                    levels[level - 1][partial]);
+                levels[level - 1][partial] = _mm256_setzero_ps();
+            }
+            const size_t mask = level_mask << (level * level_power);
+            if ((group & mask) != 0) {
+                break;
+            }
+        }
+    }
+    while (group < group_count) {
+        for (size_t partial = 0; partial < ilp_factor; ++partial) {
+            levels[0][partial] = _mm256_add_ps(
+                levels[0][partial],
+                load_bf16_square_avx2(
+                    values, group * ilp_factor + partial));
+        }
+        ++group;
+    }
+    for (size_t level = 1; level < levels_count; ++level) {
+        for (size_t partial = 0; partial < ilp_factor; ++partial) {
+            levels[0][partial] = _mm256_add_ps(
+                levels[0][partial], levels[level][partial]);
+        }
+    }
+    for (size_t vector_index = group_count * ilp_factor;
+         vector_index < vector_count; ++vector_index) {
+        levels[0][0] = _mm256_add_ps(
+            levels[0][0],
+            load_bf16_square_avx2(values, vector_index));
+    }
+    __m256 accumulator = _mm256_add_ps(
+        levels[0][0], levels[0][1]);
+    accumulator = _mm256_add_ps(accumulator, levels[0][2]);
+    accumulator = _mm256_add_ps(accumulator, levels[0][3]);
+
+    size_t index = vector_count * vector_width;
+    float result = 0.0f;
     for (; index < count; ++index) {
         const float value = to_f32(values[index]);
         result += value * value;
+    }
+    alignas(32) float lanes[vector_width];
+    _mm256_store_ps(lanes, accumulator);
+    for (size_t lane = 0; lane < vector_width; ++lane) {
+        result += lanes[lane];
     }
     return result;
 }
@@ -90,8 +154,11 @@ void rms_norm_(T* out, const T* in, const T* weight, size_t M, size_t D, float e
         // 第一步：计算均方mean(x^2>
         float sum_sq = 0.0f;
         if constexpr (std::is_same_v<T, llaisys::bf16_t>) {
-            if (__builtin_cpu_supports("avx512f")) {
-                sum_sq = bf16_sum_squares_avx512(in_row, D);
+            // PyTorch 2.4.0 dispatches the fixed CPU sum kernel used by
+            // Qwen2 RMSNorm through its AVX2 cascade path on this supported
+            // wheel, even when the host also reports AVX-512 capability.
+            if (__builtin_cpu_supports("avx2") && D >= 8) {
+                sum_sq = bf16_sum_squares_avx2(in_row, D);
             } else {
                 for (size_t i = 0; i < D; ++i) {
                     const float x = to_f32(in_row[i]);
