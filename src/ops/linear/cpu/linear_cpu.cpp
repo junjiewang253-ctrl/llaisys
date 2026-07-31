@@ -2,6 +2,7 @@
 
 #include "../../../utils.hpp"
 
+#include <array>
 #include <type_traits>
 #include <cstdint>
 
@@ -51,11 +52,17 @@ void linear_(T* out,
             const T *w_row = weight + n * K; // weight[n, 0]的地址
 
             // 累加器用float:半精度更准确；f32也没问题
-            float acc = has_bias ? to_f32(bias[n]) : 0.0f; 
-
-            // 点积：in_row与w_row的长度为K
+            // Keep f32 accumulation while reducing long-dot cancellation error.
+            // Eight independent lanes also match the reduction structure of
+            // vectorized CPU references more closely than one serial chain.
+            std::array<float, 8> partial{};
             for (size_t k = 0; k < K; ++k) {
-                acc += to_f32(in_row[k]) * to_f32(w_row[k]); 
+                partial[k % partial.size()] +=
+                    to_f32(in_row[k]) * to_f32(w_row[k]);
+            }
+            float acc = has_bias ? to_f32(bias[n]) : 0.0f;
+            for (float value : partial) {
+                acc += value;
             }
 
             // 写回out
