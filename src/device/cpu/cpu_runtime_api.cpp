@@ -60,8 +60,10 @@ void freeHost(void *ptr) {
 }
 
 void memcpySync(void *dst, const void *src, size_t size, llaisysMemcpyKind_t kind) {
+    const int raw_kind = llaisys::capi::enumValue(kind);
     llaisys::capi::guardVoid([&] {
-        if (kind < LLAISYS_MEMCPY_H2H || kind > LLAISYS_MEMCPY_D2D) {
+        if (raw_kind < LLAISYS_MEMCPY_H2H
+            || raw_kind > LLAISYS_MEMCPY_D2D) {
             throw std::invalid_argument("invalid memcpy kind");
         }
         if (size != 0 && (dst == nullptr || src == nullptr)) {

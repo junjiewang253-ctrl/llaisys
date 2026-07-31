@@ -37,10 +37,24 @@ llaisysTensor_t tensorCreate(size_t *shape,
                              llaisysDataType_t dtype,
                              llaisysDeviceType_t device_type,
                              int device_id) {
+    const int raw_dtype = llaisys::capi::enumValue(dtype);
+    const int raw_device_type = llaisys::capi::enumValue(device_type);
     return llaisys::capi::guard<llaisysTensor_t>(nullptr, [&] {
+        if (raw_dtype <= LLAISYS_DTYPE_INVALID
+            || raw_dtype > LLAISYS_DTYPE_BF16) {
+            throw std::invalid_argument("invalid data type");
+        }
+        if (raw_device_type < LLAISYS_DEVICE_CPU
+            || raw_device_type >= LLAISYS_DEVICE_TYPE_COUNT) {
+            throw std::invalid_argument("invalid device type");
+        }
         auto shape_vec = copySizes(shape, ndim, "shape");
         return new LlaisysTensor{
-            llaisys::Tensor::create(shape_vec, dtype, device_type, device_id)};
+            llaisys::Tensor::create(
+                shape_vec,
+                static_cast<llaisysDataType_t>(raw_dtype),
+                static_cast<llaisysDeviceType_t>(raw_device_type),
+                device_id)};
     });
 }
 
@@ -163,9 +177,15 @@ llaisysTensor_t tensorReshape(llaisysTensor_t tensor,
 llaisysTensor_t tensorTo(llaisysTensor_t tensor,
                          llaisysDeviceType_t device_type,
                          int device_id) {
+    const int raw_device_type = llaisys::capi::enumValue(device_type);
     return llaisys::capi::guard<llaisysTensor_t>(nullptr, [&] {
+        if (raw_device_type < LLAISYS_DEVICE_CPU
+            || raw_device_type >= LLAISYS_DEVICE_TYPE_COUNT) {
+            throw std::invalid_argument("invalid device type");
+        }
         return new LlaisysTensor{
-            requireTensor(tensor).tensor->to(device_type, device_id)};
+            requireTensor(tensor).tensor->to(
+                static_cast<llaisysDeviceType_t>(raw_device_type), device_id)};
     });
 }
 

@@ -3,6 +3,7 @@
 #include "llaisys/error.h"
 
 #include <exception>
+#include <cstring>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,14 @@ public:
 
 void clearError() noexcept;
 void setError(llaisysStatus_t code, const char *message) noexcept;
+
+template <typename Enum>
+int enumValue(Enum value) noexcept {
+    static_assert(sizeof(Enum) == sizeof(int));
+    int result = 0;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+}
 
 inline void captureCurrentException() noexcept {
     try {
