@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import torch
+from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
@@ -103,6 +104,22 @@ def main():
     os.environ["LLAISYS_QWEN2_TRACE_LAYER"] = str(layer_id)
     model = llaisys.Qwen2(str(root), device="cuda", dtype="bf16")
     trace = model.forward_trace(tokens)
+    weights = load_file(root / "model.safetensors")
+    layer_input = (
+        trace["embedding"]
+        if layer_id == 0
+        else trace[f"layer.{layer_id - 1}.output"]
+    )
+    post_attention = trace["diagnostic_post_attention"]
+
+    def cuda_rms_formula(source, weight_name):
+        source_cuda = source.cuda()
+        weight_cuda = weights[weight_name].cuda()
+        normalized = source_cuda.float() * torch.rsqrt(
+            source_cuda.float().pow(2).mean(-1, keepdim=True) + 1e-6
+        )
+        return (normalized.to(torch.bfloat16) * weight_cuda).cpu()
+
     mapping = {
         "attn_norm": "diagnostic_attn_norm",
         "q": "diagnostic_q",
@@ -121,6 +138,19 @@ def main():
         name: stats(trace[trace_name], captured[name])
         for name, trace_name in mapping.items()
     }
+    result["attn_norm_same_input_cuda_formula"] = stats(
+        trace["diagnostic_attn_norm"],
+        cuda_rms_formula(
+            layer_input, f"model.layers.{layer_id}.input_layernorm.weight"
+        ),
+    )
+    result["mlp_norm_same_input_cuda_formula"] = stats(
+        trace["diagnostic_mlp_norm"],
+        cuda_rms_formula(
+            post_attention,
+            f"model.layers.{layer_id}.post_attention_layernorm.weight",
+        ),
+    )
     print(json.dumps({
         "role": "diagnostic_only",
         "case": f"P3-prefix-{len(tokens)}",
