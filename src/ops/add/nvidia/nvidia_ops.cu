@@ -224,12 +224,16 @@ __global__ void llaisys_cuda_rope_kernel(
     const size_t base = head_token * d;
     const float exponent = 2.0f * static_cast<float>(pair) / static_cast<float>(d);
     const float angle = static_cast<float>(positions[token]) / powf(theta, exponent);
-    const float sine = sinf(angle);
-    const float cosine = cosf(angle);
+    const float sine = dtypeRound<T>(sinf(angle));
+    const float cosine = dtypeRound<T>(cosf(angle));
     const float a = toFloat(input[base + pair]);
     const float b = toFloat(input[base + half + pair]);
-    out[base + pair] = fromFloat<T>(a * cosine - b * sine);
-    out[base + half + pair] = fromFloat<T>(b * cosine + a * sine);
+    const float a_cosine = dtypeRound<T>(a * cosine);
+    const float b_cosine = dtypeRound<T>(b * cosine);
+    const float negative_b_sine = dtypeRound<T>((-b) * sine);
+    const float a_sine = dtypeRound<T>(a * sine);
+    out[base + pair] = fromFloat<T>(a_cosine + negative_b_sine);
+    out[base + half + pair] = fromFloat<T>(b_cosine + a_sine);
 }
 
 template <typename T>
