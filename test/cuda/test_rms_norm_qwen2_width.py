@@ -24,7 +24,13 @@ def main():
 
     cases = []
     total_mismatches = 0
-    for rows, seed in ((1, 92), (2, 8), (4, SEED)):
+    for rows, seed in (
+        (1, 92),
+        (2, 8),
+        (4, SEED),
+        (8, SEED + 1),
+        (32, SEED + 2),
+    ):
         generator = torch.Generator().manual_seed(seed)
         source = torch.randn((rows, WIDTH), generator=generator).to(
             torch.bfloat16
