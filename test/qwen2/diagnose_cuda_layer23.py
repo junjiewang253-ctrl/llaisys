@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
 
 import llaisys
 
@@ -101,6 +102,21 @@ def main():
         )
     for hook in hooks:
         hook.remove()
+    head_dim = reference.config.hidden_size // reference.config.num_attention_heads
+    query = captured["q"].view(
+        1, len(tokens), reference.config.num_attention_heads, head_dim
+    ).transpose(1, 2)
+    key = captured["k"].view(
+        1, len(tokens), reference.config.num_key_value_heads, head_dim
+    ).transpose(1, 2)
+    value = captured["v"].view(
+        1, len(tokens), reference.config.num_key_value_heads, head_dim
+    ).transpose(1, 2)
+    position_ids = torch.arange(len(tokens), device="cuda").unsqueeze(0)
+    cos, sin = layer.self_attn.rotary_emb(value, seq_len=len(tokens))
+    query, key = apply_rotary_pos_emb(query, key, cos, sin, position_ids)
+    captured["q_rope"] = query[0].transpose(0, 1)
+    captured["k_rope"] = key[0].transpose(0, 1)
     os.environ["LLAISYS_QWEN2_TRACE_LAYER"] = str(layer_id)
     model = llaisys.Qwen2(str(root), device="cuda", dtype="bf16")
     trace = model.forward_trace(tokens)
@@ -125,6 +141,8 @@ def main():
         "q": "diagnostic_q",
         "k": "diagnostic_k",
         "v": "diagnostic_v",
+        "q_rope": "diagnostic_q_rope",
+        "k_rope": "diagnostic_k_rope",
         "attn_value": "diagnostic_attn_value",
         "attention_out": f"layer.{layer_id}.attention_out",
         "mlp_norm": "diagnostic_mlp_norm",
