@@ -47,7 +47,11 @@ void setDevice(int device) {
         if (device < 0) {
             throw std::invalid_argument("CUDA device id must be non-negative");
         }
-        checkCuda(cudaSetDevice(device), "cudaSetDevice");
+        const auto status = cudaSetDevice(device);
+        if (status == cudaErrorInvalidDevice) {
+            throw std::invalid_argument("CUDA device id is not visible");
+        }
+        checkCuda(status, "cudaSetDevice");
     });
 }
 
