@@ -40,9 +40,10 @@ def main():
             "explain in one sentence why ten follows nine."
         ),
     }
+    prefix_length = int(os.environ.get("LLAISYS_M6B_DIAGNOSTIC_PREFIX", "1"))
     tokens = list(tokenizer.apply_chat_template(
         [message], tokenize=True, add_generation_prompt=True
-    ))[:1]
+    ))[:prefix_length]
     reference = AutoModelForCausalLM.from_pretrained(
         root, local_files_only=True, trust_remote_code=False,
         torch_dtype=torch.bfloat16, attn_implementation="eager",
@@ -78,7 +79,7 @@ def main():
             result[name] = stats(trace[name][-1], captured[name])
     print(json.dumps({
         "role": "diagnostic_only",
-        "case": "P3-prefix-1",
+        "case": f"P3-prefix-{len(tokens)}",
         "atol": 0.03,
         "rtol": 0.03,
         "boundaries": result,
