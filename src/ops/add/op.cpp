@@ -4,6 +4,9 @@
 #include "../../utils.hpp"
 
 #include "cpu/add_cpu.hpp" // 引入CPU后端实现
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/nvidia_ops.hpp"
+#endif
 
 namespace llaisys::ops {
 void add(tensor_t c, tensor_t a, tensor_t b) {
@@ -26,8 +29,8 @@ void add(tensor_t c, tensor_t a, tensor_t b) {
 // NVIDIA 分支被宏保护：没开 CUDA 的时候编译器根本看不到这段
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
-        return;
+        return nvidia::add(c->data(), a->data(), b->data(), c->dtype(),
+                           c->numel(), llaisys::core::context().runtime().stream());
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

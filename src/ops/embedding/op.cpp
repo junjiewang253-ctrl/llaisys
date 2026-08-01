@@ -4,6 +4,9 @@
 #include "../../utils.hpp"
 
 #include "cpu/embedding_cpu.hpp" // 引入CPU后端实现
+#ifdef ENABLE_NVIDIA_API
+#include "../add/nvidia/nvidia_ops.hpp"
+#endif
 
 namespace llaisys::ops {
 void embedding(tensor_t out, tensor_t index, tensor_t weight) {
@@ -52,8 +55,9 @@ void embedding(tensor_t out, tensor_t index, tensor_t weight) {
                               N, D, V);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
-        return;
+        return nvidia::embedding(
+            out->data(), index->data(), weight->data(), out->dtype(), N, D, V,
+            llaisys::core::context().runtime().stream());
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;
