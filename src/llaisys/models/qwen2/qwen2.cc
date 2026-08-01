@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #undef __C
 #include <immintrin.h>
@@ -73,6 +74,11 @@ static bool meta_sane(const LlaisysQwen2Meta *m) {
         return false;
     }
     if (m->maxseq == 0) {
+        return false;
+    }
+    if (m->dtype != LLAISYS_DTYPE_F32 &&
+        m->dtype != LLAISYS_DTYPE_F16 &&
+        m->dtype != LLAISYS_DTYPE_BF16) {
         return false;
     }
     return true;
@@ -239,6 +245,52 @@ static llaisysTensor_t make_tensor_3d(size_t a, size_t b, size_t c, llaisysDataT
     return tensorCreate(shape, 3, dt, dev, devid);
 }
 
+static size_t checked_multiply(size_t lhs, size_t rhs, const char *message) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        throw std::overflow_error(message);
+    }
+    return lhs * rhs;
+}
+
+static size_t kv_payload_bytes(const LlaisysQwen2Model *model) {
+    if (!model) {
+        return 0;
+    }
+    size_t elements = checked_multiply(
+        2, model->meta.nlayer, "Qwen2 KV layer count overflow");
+    elements = checked_multiply(
+        elements, model->meta.maxseq, "Qwen2 KV capacity overflow");
+    elements = checked_multiply(
+        elements, model->meta.nkvh, "Qwen2 KV head count overflow");
+    elements = checked_multiply(
+        elements, model->meta.dh, "Qwen2 KV head dimension overflow");
+    return checked_multiply(
+        elements, llaisys::utils::dsize(model->meta.dtype),
+        "Qwen2 KV byte size overflow");
+}
+
+static void kv_alloc(LlaisysQwen2Model *model) {
+    if (!model) {
+        throw std::invalid_argument("Qwen2 KV model is null");
+    }
+    // Validate the complete byte expression before making any allocation.
+    (void)kv_payload_bytes(model);
+    model->k_cache = new llaisysTensor_t[model->meta.nlayer]();
+    model->v_cache = new llaisysTensor_t[model->meta.nlayer]();
+    const int device_id = pick_device_id(model);
+    for (size_t layer = 0; layer < model->meta.nlayer; ++layer) {
+        model->k_cache[layer] = make_tensor_3d(
+            model->meta.maxseq, model->meta.nkvh, model->meta.dh,
+            model->meta.dtype, model->device, device_id);
+        model->v_cache[layer] = make_tensor_3d(
+            model->meta.maxseq, model->meta.nkvh, model->meta.dh,
+            model->meta.dtype, model->device, device_id);
+        if (!model->k_cache[layer] || !model->v_cache[layer]) {
+            throw std::runtime_error("failed to allocate Qwen2 KV cache");
+        }
+    }
+}
+
 static void trace_clear(LlaisysQwen2Model *model) {
     if (!model) {
         return;
@@ -370,7 +422,8 @@ static void qwen2_attention_bf16(llaisysTensor_t out,
                                  llaisysTensor_t query,
                                  llaisysTensor_t key,
                                  llaisysTensor_t value,
-                                 size_t sequence,
+                                 size_t query_length,
+                                 size_t total_length,
                                  size_t heads,
                                  size_t kv_heads,
                                  size_t dimension,
@@ -388,28 +441,32 @@ static void qwen2_attention_bf16(llaisysTensor_t out,
         reinterpret_cast<llaisys::bf16_t *>(tensorGetData(out));
     const size_t group = heads / kv_heads;
     std::vector<llaisys::bf16_t> queries(
-        heads * sequence * dimension);
+        heads * query_length * dimension);
     std::vector<llaisys::bf16_t> keys(
-        heads * sequence * dimension);
+        heads * total_length * dimension);
     std::vector<llaisys::bf16_t> values(
-        heads * sequence * value_dimension);
+        heads * total_length * value_dimension);
     for (size_t head = 0; head < heads; ++head) {
         const size_t kv_head = head / group;
-        for (size_t token = 0; token < sequence; ++token) {
+        for (size_t token = 0; token < query_length; ++token) {
             std::copy_n(
                 query_data + (token * heads + head) * dimension,
                 dimension,
-                queries.data() + (head * sequence + token) * dimension);
+                queries.data() +
+                    (head * query_length + token) * dimension);
+        }
+        for (size_t token = 0; token < total_length; ++token) {
             std::copy_n(
                 key_data + (token * kv_heads + kv_head) * dimension,
                 dimension,
-                keys.data() + (head * sequence + token) * dimension);
+                keys.data() +
+                    (head * total_length + token) * dimension);
             std::copy_n(
                 value_data +
                     (token * kv_heads + kv_head) * value_dimension,
                 value_dimension,
                 values.data() +
-                    (head * sequence + token) * value_dimension);
+                    (head * total_length + token) * value_dimension);
         }
     }
 
@@ -417,32 +474,33 @@ static void qwen2_attention_bf16(llaisysTensor_t out,
     static dnnl::stream stream(engine);
     const dnnl::memory::dims query_dims{
         static_cast<dnnl_dim_t>(heads),
-        static_cast<dnnl_dim_t>(sequence),
+        static_cast<dnnl_dim_t>(query_length),
         static_cast<dnnl_dim_t>(dimension)};
     const dnnl::memory::dims query_strides{
-        static_cast<dnnl_dim_t>(sequence * dimension),
+        static_cast<dnnl_dim_t>(query_length * dimension),
         static_cast<dnnl_dim_t>(dimension), 1};
     const dnnl::memory::dims key_dims{
         static_cast<dnnl_dim_t>(heads),
         static_cast<dnnl_dim_t>(dimension),
-        static_cast<dnnl_dim_t>(sequence)};
+        static_cast<dnnl_dim_t>(total_length)};
     const dnnl::memory::dims key_strides{
-        static_cast<dnnl_dim_t>(sequence * dimension), 1,
+        static_cast<dnnl_dim_t>(total_length * dimension), 1,
         static_cast<dnnl_dim_t>(dimension)};
     const dnnl::memory::dims score_dims{
         static_cast<dnnl_dim_t>(heads),
-        static_cast<dnnl_dim_t>(sequence),
-        static_cast<dnnl_dim_t>(sequence)};
+        static_cast<dnnl_dim_t>(query_length),
+        static_cast<dnnl_dim_t>(total_length)};
     const dnnl::memory::dims score_strides{
-        static_cast<dnnl_dim_t>(sequence * sequence),
-        static_cast<dnnl_dim_t>(sequence), 1};
+        static_cast<dnnl_dim_t>(query_length * total_length),
+        static_cast<dnnl_dim_t>(total_length), 1};
     const auto query_desc = dnnl::memory::desc(
         query_dims, dnnl::memory::data_type::bf16, query_strides);
     const auto key_desc = dnnl::memory::desc(
         key_dims, dnnl::memory::data_type::bf16, key_strides);
     const auto score_desc = dnnl::memory::desc(
         score_dims, dnnl::memory::data_type::bf16, score_strides);
-    std::vector<llaisys::bf16_t> scores(heads * sequence * sequence);
+    std::vector<llaisys::bf16_t> scores(
+        heads * query_length * total_length);
     const dnnl::matmul::primitive_desc score_primitive_desc(
         engine, query_desc, key_desc, score_desc);
     dnnl::matmul(score_primitive_desc)
@@ -456,12 +514,15 @@ static void qwen2_attention_bf16(llaisysTensor_t out,
                  dnnl::memory(score_desc, engine, scores.data())}});
     stream.wait();
 
-    std::vector<float> scaled_scores(heads * sequence * sequence);
+    std::vector<float> scaled_scores(
+        heads * query_length * total_length);
+    const size_t prefix = total_length - query_length;
     for (size_t head = 0; head < heads; ++head) {
-        for (size_t row = 0; row < sequence; ++row) {
+        for (size_t row = 0; row < query_length; ++row) {
             const size_t offset =
-                (head * sequence + row) * sequence;
-            for (size_t column = 0; column <= row; ++column) {
+                (head * query_length + row) * total_length;
+            const size_t last_visible = prefix + row;
+            for (size_t column = 0; column <= last_visible; ++column) {
                 const auto scaled = llaisys::utils::cast<llaisys::bf16_t>(
                     llaisys::utils::cast<float>(scores[offset + column]) *
                     scale);
@@ -469,7 +530,8 @@ static void qwen2_attention_bf16(llaisysTensor_t out,
                 scaled_scores[offset + column] =
                     llaisys::utils::cast<float>(scaled);
             }
-            for (size_t column = row + 1; column < sequence; ++column) {
+            for (size_t column = last_visible + 1;
+                 column < total_length; ++column) {
                 scores[offset + column] =
                     llaisys::utils::cast<llaisys::bf16_t>(
                         -std::numeric_limits<float>::infinity());
@@ -481,7 +543,7 @@ static void qwen2_attention_bf16(llaisysTensor_t out,
     const auto probability_f32_desc = dnnl::memory::desc(
         score_dims, dnnl::memory::data_type::f32, score_strides);
     std::vector<float> probabilities_f32(
-        heads * sequence * sequence);
+        heads * query_length * total_length);
     const auto softmax_primitive_desc =
         dnnl::softmax_forward::primitive_desc(
             engine, dnnl::prop_kind::forward_inference,
@@ -500,7 +562,7 @@ static void qwen2_attention_bf16(llaisysTensor_t out,
                      probabilities_f32.data())}});
     stream.wait();
     std::vector<llaisys::bf16_t> probabilities(
-        heads * sequence * sequence);
+        heads * query_length * total_length);
     for (size_t index = 0; index < probabilities.size(); ++index) {
         probabilities[index] =
             llaisys::utils::cast<llaisys::bf16_t>(
@@ -508,32 +570,43 @@ static void qwen2_attention_bf16(llaisysTensor_t out,
     }
     if (score_trace) {
         *score_trace = make_tensor_3d(
-            heads, sequence, sequence, LLAISYS_DTYPE_BF16,
+            heads, query_length, total_length, LLAISYS_DTYPE_BF16,
             LLAISYS_DEVICE_CPU, 0);
         tensorLoad(*score_trace, scores.data());
         require_op_success("attention score trace");
     }
     if (probability_trace) {
         *probability_trace = make_tensor_3d(
-            heads, sequence, sequence, LLAISYS_DTYPE_BF16,
+            heads, query_length, total_length, LLAISYS_DTYPE_BF16,
             LLAISYS_DEVICE_CPU, 0);
         tensorLoad(*probability_trace, probabilities.data());
         require_op_success("attention probability trace");
     }
 
-    const dnnl::memory::dims value_dims{
+    const dnnl::memory::dims value_source_dims{
         static_cast<dnnl_dim_t>(heads),
-        static_cast<dnnl_dim_t>(sequence),
+        static_cast<dnnl_dim_t>(total_length),
         static_cast<dnnl_dim_t>(value_dimension)};
-    const dnnl::memory::dims value_strides{
-        static_cast<dnnl_dim_t>(sequence * value_dimension),
+    const dnnl::memory::dims value_source_strides{
+        static_cast<dnnl_dim_t>(total_length * value_dimension),
         static_cast<dnnl_dim_t>(value_dimension), 1};
-    const auto value_desc = dnnl::memory::desc(
-        value_dims, dnnl::memory::data_type::bf16, value_strides);
+    const dnnl::memory::dims attended_dims{
+        static_cast<dnnl_dim_t>(heads),
+        static_cast<dnnl_dim_t>(query_length),
+        static_cast<dnnl_dim_t>(value_dimension)};
+    const dnnl::memory::dims attended_strides{
+        static_cast<dnnl_dim_t>(query_length * value_dimension),
+        static_cast<dnnl_dim_t>(value_dimension), 1};
+    const auto value_source_desc = dnnl::memory::desc(
+        value_source_dims, dnnl::memory::data_type::bf16,
+        value_source_strides);
+    const auto attended_desc = dnnl::memory::desc(
+        attended_dims, dnnl::memory::data_type::bf16,
+        attended_strides);
     std::vector<llaisys::bf16_t> attended(
-        heads * sequence * value_dimension);
+        heads * query_length * value_dimension);
     const dnnl::matmul::primitive_desc value_primitive_desc(
-        engine, score_desc, value_desc, value_desc);
+        engine, score_desc, value_source_desc, attended_desc);
     dnnl::matmul(value_primitive_desc)
         .execute(
             stream,
@@ -541,15 +614,15 @@ static void qwen2_attention_bf16(llaisysTensor_t out,
                  dnnl::memory(
                      score_desc, engine, probabilities.data())},
              {DNNL_ARG_WEIGHTS,
-                 dnnl::memory(value_desc, engine, values.data())},
+                 dnnl::memory(value_source_desc, engine, values.data())},
              {DNNL_ARG_DST,
-                 dnnl::memory(value_desc, engine, attended.data())}});
+                 dnnl::memory(attended_desc, engine, attended.data())}});
     stream.wait();
-    for (size_t token = 0; token < sequence; ++token) {
+    for (size_t token = 0; token < query_length; ++token) {
         for (size_t head = 0; head < heads; ++head) {
             std::copy_n(
                 attended.data() +
-                    (head * sequence + token) * value_dimension,
+                    (head * query_length + token) * value_dimension,
                 value_dimension,
                 destination +
                     (token * heads + head) * value_dimension);
@@ -708,8 +781,16 @@ __export LlaisysQwen2Model *llaisysQwen2ModelCreate(
         m->device_ids.assign(device_ids, device_ids + ndevice);
     }
 
-    weights_alloc(m);
-    return m;
+    try {
+        weights_alloc(m);
+        kv_alloc(m);
+        return m;
+    } catch (const std::exception &) {
+        kv_free(m);
+        weights_free_and_destroy_tensors(m);
+        delete m;
+        return nullptr;
+    }
 }
 
 __export void llaisysQwen2ModelDestroy(LlaisysQwen2Model *model) {
@@ -734,7 +815,11 @@ __export LlaisysQwen2Weights *llaisysQwen2ModelWeights(LlaisysQwen2Model *model)
     return &model->w;
 }
 
-__export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
+static int64_t qwen2_model_infer_impl(
+    LlaisysQwen2Model *model,
+    const int64_t *token_ids,
+    size_t ntoken,
+    bool use_cache) {
     // ---- switches ----
     static const bool DEBUG_LAYERS = false;   // 逐层日志（默认关）
     static const bool STAGE_MARKS = false;     // 阶段打点（默认开，用于定位卡住）
@@ -793,9 +878,13 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             MARK("weights not ready");
             return -2;
         }
-        if (ntoken > model->meta.maxseq) {
+        if ((!use_cache && ntoken > model->meta.maxseq) ||
+            (use_cache && ntoken > model->meta.maxseq - model->cached_len)) {
             std::fprintf(stderr, "[infer] ntoken too long: ntoken=%zu maxseq=%zu\n", ntoken, model->meta.maxseq);
             return -3;
+        }
+        if (use_cache && model->device != LLAISYS_DEVICE_CPU) {
+            return -8;
         }
 
         const auto &meta = model->meta;
@@ -831,14 +920,16 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
         model->trace.layer_output = new llaisysTensor_t[meta.nlayer]();
 
         std::fprintf(stderr,
-                     "[infer] device=%d devid=%d ntoken=%zu cached_len=%zu dtype=%d nlayer=%zu hs=%zu nh=%zu nkvh=%zu dh=%zu di=%zu voc=%zu maxseq=%zu\n",
-                     (int)model->device, devid, ntoken, model->cached_len, (int)meta.dtype, meta.nlayer, meta.hs, meta.nh,
+                     "[infer] device=%d devid=%d ntoken=%zu cache_mode=%d dtype=%d nlayer=%zu hs=%zu nh=%zu nkvh=%zu dh=%zu di=%zu voc=%zu maxseq=%zu\n",
+                     (int)model->device, devid, ntoken, use_cache ? 1 : 0, (int)meta.dtype, meta.nlayer, meta.hs, meta.nh,
                      meta.nkvh, meta.dh, meta.di, meta.voc, meta.maxseq);
         std::fflush(stderr);
 
-        // M4 contract: every invocation recomputes the complete prefix.
-        const size_t start = 0;
+        // M4 no-cache calls always recompute their complete supplied prefix.
+        // M5 cached calls accept only the new chunk and use an explicit cursor.
+        const size_t start = use_cache ? model->cached_len : 0;
         const size_t new_len = ntoken;
+        const size_t total_len = start + new_len;
         std::fprintf(stderr, "[infer] start=%zu new_len=%zu\n", start, new_len);
         std::fflush(stderr);
         if (new_len == 0) {
@@ -850,7 +941,7 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
         // token ids new: [new_len] int64
         MARK("alloc/load tokens");
         TensorGuard t_tok(make_tensor_1d(new_len, LLAISYS_DTYPE_I64, model->device, devid));
-        tensorLoad(t_tok.t, token_ids + start);
+        tensorLoad(t_tok.t, token_ids);
 
         // pos ids absolute: [new_len] int64
         MARK("alloc/load pos");
@@ -935,6 +1026,42 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
                 model->trace.diagnostic_k_rope = trace_copy(k_rope.t);
             }
 
+            TensorGuard k_total;
+            TensorGuard v_total;
+            llaisysTensor_t attention_k = k_rope.t;
+            llaisysTensor_t attention_v = v3.t;
+            if (use_cache) {
+                const size_t row_elements = meta.nkvh * meta.dh;
+                const size_t row_bytes =
+                    row_elements * llaisys::utils::dsize(meta.dtype);
+                auto *cache_k = reinterpret_cast<std::byte *>(
+                    tensorGetData(model->k_cache[l]));
+                auto *cache_v = reinterpret_cast<std::byte *>(
+                    tensorGetData(model->v_cache[l]));
+                const auto *new_k = reinterpret_cast<const std::byte *>(
+                    tensorGetData(k_rope.t));
+                const auto *new_v = reinterpret_cast<const std::byte *>(
+                    tensorGetData(v3.t));
+                if (!cache_k || !cache_v || !new_k || !new_v) {
+                    throw std::runtime_error("KV cache data unavailable");
+                }
+                std::memcpy(
+                    cache_k + start * row_bytes, new_k,
+                    new_len * row_bytes);
+                std::memcpy(
+                    cache_v + start * row_bytes, new_v,
+                    new_len * row_bytes);
+                k_total = TensorGuard(tensorSlice(
+                    model->k_cache[l], 0, 0, total_len));
+                v_total = TensorGuard(tensorSlice(
+                    model->v_cache[l], 0, 0, total_len));
+                if (!k_total.t || !v_total.t) {
+                    throw std::runtime_error("failed to view Qwen2 KV cache");
+                }
+                attention_k = k_total.t;
+                attention_v = v_total.t;
+            }
+
             if (l == 0) {
                 MARK("L0: self_attention");
             }
@@ -945,8 +1072,8 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
             TensorGuard attn_val(make_tensor_3d(new_len, meta.nh, dv, meta.dtype, model->device, devid));
             if (l == 0) {
                 dump_shape("q_rope", q_rope.t);
-                dump_shape("k_total", k_rope.t);
-                dump_shape("v_total", v3.t);
+                dump_shape("k_total", attention_k);
+                dump_shape("v_total", attention_v);
                 dump_shape("attn_val(out, pre)", attn_val.t);
             }
 
@@ -954,8 +1081,8 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
                 meta.dtype == LLAISYS_DTYPE_BF16) {
 #ifdef LLAISYS_USE_DNNL
                 qwen2_attention_bf16(
-                    attn_val.t, q_rope.t, k_rope.t, v3.t,
-                    new_len, meta.nh, meta.nkvh, meta.dh, dv,
+                    attn_val.t, q_rope.t, attention_k, attention_v,
+                    new_len, total_len, meta.nh, meta.nkvh, meta.dh, dv,
                     attn_scale,
                     l == diagnostic_layer
                         ? &model->trace.diagnostic_attention_scores
@@ -965,12 +1092,14 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
                         : nullptr);
 #else
                 llaisysSelfAttention(
-                    attn_val.t, q_rope.t, k_rope.t, v3.t, attn_scale);
+                    attn_val.t, q_rope.t, attention_k, attention_v,
+                    attn_scale);
                 require_op_success("self attention");
 #endif
             } else {
                 llaisysSelfAttention(
-                    attn_val.t, q_rope.t, k_rope.t, v3.t, attn_scale);
+                    attn_val.t, q_rope.t, attention_k, attention_v,
+                    attn_scale);
                 require_op_success("self attention");
             }
             if (l == diagnostic_layer) {
@@ -1081,6 +1210,12 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
         int64_t out = *reinterpret_cast<int64_t *>(p);
         model->trace.greedy_token = out;
 
+        if (use_cache) {
+            model->cached_len = total_len;
+            model->cached_tokens.insert(
+                model->cached_tokens.end(), token_ids, token_ids + ntoken);
+        }
+
         std::fprintf(stderr, "[infer] return token=%lld\n", (long long)out);
         std::fflush(stderr);
         return out;
@@ -1094,6 +1229,77 @@ __export int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token
         std::fflush(stderr);
         return -998;
     }
+}
+
+__export int64_t llaisysQwen2ModelInfer(
+    LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
+    return qwen2_model_infer_impl(model, token_ids, ntoken, false);
+}
+
+__export int64_t llaisysQwen2ModelInferCached(
+    LlaisysQwen2Model *model, llaisysTensor_t token_ids) {
+    if (!model || !token_ids) {
+        return -1;
+    }
+    if (tensorGetNdim(token_ids) != 1) {
+        return -4;
+    }
+    if (tensorGetDataType(token_ids) != LLAISYS_DTYPE_I64) {
+        return -5;
+    }
+    if (tensorGetDeviceType(token_ids) != model->device ||
+        tensorGetDeviceId(token_ids) != pick_device_id(model)) {
+        return -6;
+    }
+    size_t shape[1]{};
+    tensorGetShape(token_ids, shape);
+    if (shape[0] == 0) {
+        return -7;
+    }
+    auto *data = reinterpret_cast<const int64_t *>(tensorGetData(token_ids));
+    if (!data) {
+        return -1;
+    }
+    return qwen2_model_infer_impl(model, data, shape[0], true);
+}
+
+__export int llaisysQwen2ModelResetCache(LlaisysQwen2Model *model) {
+    if (!model) {
+        return -1;
+    }
+    model->cached_len = 0;
+    model->cached_tokens.clear();
+    return 0;
+}
+
+__export size_t llaisysQwen2ModelCacheCursor(
+    const LlaisysQwen2Model *model) {
+    return model ? model->cached_len : 0;
+}
+
+__export size_t llaisysQwen2ModelCacheCapacity(
+    const LlaisysQwen2Model *model) {
+    return model ? model->meta.maxseq : 0;
+}
+
+__export size_t llaisysQwen2ModelCacheAllocatedBytes(
+    const LlaisysQwen2Model *model) {
+    try {
+        return kv_payload_bytes(model);
+    } catch (...) {
+        return 0;
+    }
+}
+
+__export uintptr_t llaisysQwen2ModelCacheAddress(
+    const LlaisysQwen2Model *model, size_t layer, int value_cache) {
+    if (!model || layer >= model->meta.nlayer ||
+        (value_cache != 0 && value_cache != 1)) {
+        return 0;
+    }
+    const auto tensor =
+        value_cache == 0 ? model->k_cache[layer] : model->v_cache[layer];
+    return reinterpret_cast<uintptr_t>(tensorGetData(tensor));
 }
 
 } // extern "C"

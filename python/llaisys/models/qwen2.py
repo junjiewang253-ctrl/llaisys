@@ -75,6 +75,25 @@ def _set_ctypes_signatures():
         ctypes.POINTER(ctypes.c_int64),
         ctypes.c_size_t,
     ]
+    lib.llaisysQwen2ModelInferCached.restype = ctypes.c_int64
+    lib.llaisysQwen2ModelInferCached.argtypes = [
+        LlaisysQwen2Model_p,
+        ctypes.c_void_p,
+    ]
+    lib.llaisysQwen2ModelResetCache.restype = ctypes.c_int
+    lib.llaisysQwen2ModelResetCache.argtypes = [LlaisysQwen2Model_p]
+    lib.llaisysQwen2ModelCacheCursor.restype = ctypes.c_size_t
+    lib.llaisysQwen2ModelCacheCursor.argtypes = [LlaisysQwen2Model_p]
+    lib.llaisysQwen2ModelCacheCapacity.restype = ctypes.c_size_t
+    lib.llaisysQwen2ModelCacheCapacity.argtypes = [LlaisysQwen2Model_p]
+    lib.llaisysQwen2ModelCacheAllocatedBytes.restype = ctypes.c_size_t
+    lib.llaisysQwen2ModelCacheAllocatedBytes.argtypes = [LlaisysQwen2Model_p]
+    lib.llaisysQwen2ModelCacheAddress.restype = ctypes.c_size_t
+    lib.llaisysQwen2ModelCacheAddress.argtypes = [
+        LlaisysQwen2Model_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
     lib.llaisysQwen2ModelTrace.restype = ctypes.POINTER(LlaisysQwen2Trace)
     lib.llaisysQwen2ModelTrace.argtypes = [LlaisysQwen2Model_p]
 
@@ -388,6 +407,53 @@ class Qwen2:
             raise RuntimeError(f"llaisysQwen2ModelInfer failed: code={out}, ntoken={len(token_ids)}")
         return out
 
+    def reset_cache(self) -> None:
+        status = int(lib.llaisysQwen2ModelResetCache(self._model))
+        check_last_error()
+        if status != 0:
+            raise RuntimeError(f"llaisysQwen2ModelResetCache failed: code={status}")
+
+    def cache_info(self):
+        layers = int(self.meta.nlayer)
+        return {
+            "cursor": int(lib.llaisysQwen2ModelCacheCursor(self._model)),
+            "capacity": int(lib.llaisysQwen2ModelCacheCapacity(self._model)),
+            "allocated_bytes": int(
+                lib.llaisysQwen2ModelCacheAllocatedBytes(self._model)
+            ),
+            "k_addresses": [
+                int(lib.llaisysQwen2ModelCacheAddress(self._model, layer, 0))
+                for layer in range(layers)
+            ],
+            "v_addresses": [
+                int(lib.llaisysQwen2ModelCacheAddress(self._model, layer, 1))
+                for layer in range(layers)
+            ],
+        }
+
+    def infer_cached_next(self, token_ids: list[int]) -> int:
+        tokens = _normalize_input_ids(token_ids)
+        if not tokens:
+            raise ValueError("cached inference requires at least one token")
+        array = np.ascontiguousarray(tokens, dtype=np.int64)
+        tensor = _tensor_from_numpy(
+            array,
+            llaisys_dtype=LLAISYS_DTYPE_I64,
+            device=self.device,
+            device_id=self.device_id,
+        )
+        try:
+            output = int(lib.llaisysQwen2ModelInferCached(self._model, tensor))
+            check_last_error()
+        finally:
+            lib.tensorDestroy(tensor)
+        if output < 0:
+            raise RuntimeError(
+                "llaisysQwen2ModelInferCached failed: "
+                f"code={output}, ntoken={len(tokens)}"
+            )
+        return output
+
     @staticmethod
     def _trace_tensor(handle):
         ndim = int(lib.tensorGetNdim(handle))
@@ -415,6 +481,13 @@ class Qwen2:
     def forward_trace(self, token_ids):
         tokens = _normalize_input_ids(token_ids)
         greedy = self.infer_next(tokens)
+        return self._capture_trace(greedy)
+
+    def forward_cached_trace(self, token_ids):
+        greedy = self.infer_cached_next(token_ids)
+        return self._capture_trace(greedy)
+
+    def _capture_trace(self, greedy):
         pointer = lib.llaisysQwen2ModelTrace(self._model)
         check_last_error()
         if not pointer:
@@ -481,12 +554,15 @@ class Qwen2:
         # 关键：不要超过 C++ 侧 meta.maxseq，否则会返回 -3
         maxseq = int(self.meta.maxseq)
 
+        self.reset_cache()
+        pending = list(tokens)
         for _ in range(max_new_tokens):
             if len(tokens) >= maxseq:
                 break  # 这句就放在这里（每次推理前做上限检查）
 
-            nxt = self.infer_next(tokens)
+            nxt = self.infer_cached_next(pending)
             tokens.append(int(nxt))
+            pending = [int(nxt)]
 
             if int(nxt) == int(eos_token_id):
                 break

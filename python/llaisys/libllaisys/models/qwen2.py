@@ -86,5 +86,30 @@ lib.llaisysQwen2ModelInfer.argtypes = [
     ctypes.c_size_t,
 ]
 
+lib.llaisysQwen2ModelInferCached.restype = ctypes.c_int64
+lib.llaisysQwen2ModelInferCached.argtypes = [
+    LlaisysQwen2Model_p,
+    llaisysTensor_t,
+]
+
+lib.llaisysQwen2ModelResetCache.restype = ctypes.c_int
+lib.llaisysQwen2ModelResetCache.argtypes = [LlaisysQwen2Model_p]
+
+lib.llaisysQwen2ModelCacheCursor.restype = ctypes.c_size_t
+lib.llaisysQwen2ModelCacheCursor.argtypes = [LlaisysQwen2Model_p]
+
+lib.llaisysQwen2ModelCacheCapacity.restype = ctypes.c_size_t
+lib.llaisysQwen2ModelCacheCapacity.argtypes = [LlaisysQwen2Model_p]
+
+lib.llaisysQwen2ModelCacheAllocatedBytes.restype = ctypes.c_size_t
+lib.llaisysQwen2ModelCacheAllocatedBytes.argtypes = [LlaisysQwen2Model_p]
+
+lib.llaisysQwen2ModelCacheAddress.restype = ctypes.c_size_t
+lib.llaisysQwen2ModelCacheAddress.argtypes = [
+    LlaisysQwen2Model_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+]
+
 lib.llaisysQwen2ModelTrace.restype = ctypes.POINTER(LlaisysQwen2Trace)
 lib.llaisysQwen2ModelTrace.argtypes = [LlaisysQwen2Model_p]

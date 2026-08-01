@@ -63,6 +63,24 @@ __C {
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
 
+    __export int64_t llaisysQwen2ModelInferCached(
+        struct LlaisysQwen2Model *model, llaisysTensor_t token_ids);
+
+    __export int llaisysQwen2ModelResetCache(
+        struct LlaisysQwen2Model *model);
+
+    __export size_t llaisysQwen2ModelCacheCursor(
+        const struct LlaisysQwen2Model *model);
+
+    __export size_t llaisysQwen2ModelCacheCapacity(
+        const struct LlaisysQwen2Model *model);
+
+    __export size_t llaisysQwen2ModelCacheAllocatedBytes(
+        const struct LlaisysQwen2Model *model);
+
+    __export uintptr_t llaisysQwen2ModelCacheAddress(
+        const struct LlaisysQwen2Model *model, size_t layer, int value_cache);
+
     __export const struct LlaisysQwen2Trace *llaisysQwen2ModelTrace(
         struct LlaisysQwen2Model *model);
 }
