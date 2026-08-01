@@ -1,6 +1,7 @@
 ﻿#include "llaisys/models/qwen2.h"
 #include "llaisys/error.h"
 #include "llaisys/ops.h"
+#include "llaisys/runtime.h"
 #include "llaisys/tensor.h"
 
 #include "../../../utils.hpp"
@@ -52,6 +53,49 @@ static int pick_device_id(const LlaisysQwen2Model *m) {
         return m->device_ids[0];
     }
     return 0;
+}
+
+static const LlaisysRuntimeAPI *model_runtime(const LlaisysQwen2Model *model) {
+    if (!model || model->device == LLAISYS_DEVICE_CPU) {
+        return nullptr;
+    }
+    llaisysSetContextRuntime(model->device, pick_device_id(model));
+    const auto *api = llaisysGetRuntimeAPI(model->device);
+    if (!api || llaisysGetLastErrorCode() != LLAISYS_STATUS_SUCCESS) {
+        throw std::runtime_error("Qwen2 device runtime is unavailable");
+    }
+    api->set_device(pick_device_id(model));
+    return api;
+}
+
+static void copy_tensor_bytes(LlaisysQwen2Model *model,
+                              void *destination,
+                              const void *source,
+                              size_t bytes,
+                              llaisysMemcpyKind_t kind) {
+    if (bytes == 0) {
+        return;
+    }
+    if (!destination || !source) {
+        throw std::runtime_error("Qwen2 tensor copy received a null pointer");
+    }
+    if (model->device == LLAISYS_DEVICE_CPU) {
+        std::memcpy(destination, source, bytes);
+        return;
+    }
+    const auto *api = model_runtime(model);
+    api->device_synchronize();
+    if (llaisysGetLastErrorCode() != LLAISYS_STATUS_SUCCESS) {
+        throw std::runtime_error("Qwen2 device synchronization before copy failed");
+    }
+    api->memcpy_sync(destination, source, bytes, kind);
+    if (llaisysGetLastErrorCode() != LLAISYS_STATUS_SUCCESS) {
+        throw std::runtime_error("Qwen2 device copy failed");
+    }
+    api->device_synchronize();
+    if (llaisysGetLastErrorCode() != LLAISYS_STATUS_SUCCESS) {
+        throw std::runtime_error("Qwen2 device synchronization after copy failed");
+    }
 }
 
 static bool meta_sane(const LlaisysQwen2Meta *m) {
@@ -883,10 +927,6 @@ static int64_t qwen2_model_infer_impl(
             std::fprintf(stderr, "[infer] ntoken too long: ntoken=%zu maxseq=%zu\n", ntoken, model->meta.maxseq);
             return -3;
         }
-        if (use_cache && model->device != LLAISYS_DEVICE_CPU) {
-            return -8;
-        }
-
         const auto &meta = model->meta;
         const int devid = pick_device_id(model);
         size_t diagnostic_layer = 0;
@@ -1045,12 +1085,15 @@ static int64_t qwen2_model_infer_impl(
                 if (!cache_k || !cache_v || !new_k || !new_v) {
                     throw std::runtime_error("KV cache data unavailable");
                 }
-                std::memcpy(
-                    cache_k + start * row_bytes, new_k,
-                    new_len * row_bytes);
-                std::memcpy(
-                    cache_v + start * row_bytes, new_v,
-                    new_len * row_bytes);
+                const auto copy_kind = model->device == LLAISYS_DEVICE_CPU
+                    ? LLAISYS_MEMCPY_H2H
+                    : LLAISYS_MEMCPY_D2D;
+                copy_tensor_bytes(
+                    model, cache_k + start * row_bytes, new_k,
+                    new_len * row_bytes, copy_kind);
+                copy_tensor_bytes(
+                    model, cache_v + start * row_bytes, new_v,
+                    new_len * row_bytes, copy_kind);
                 k_total = TensorGuard(tensorSlice(
                     model->k_cache[l], 0, 0, total_len));
                 v_total = TensorGuard(tensorSlice(
@@ -1207,7 +1250,12 @@ static int64_t qwen2_model_infer_impl(
         if (!p) {
             return -100;
         }
-        int64_t out = *reinterpret_cast<int64_t *>(p);
+        int64_t out = 0;
+        copy_tensor_bytes(
+            model, &out, p, sizeof(out),
+            model->device == LLAISYS_DEVICE_CPU
+                ? LLAISYS_MEMCPY_H2H
+                : LLAISYS_MEMCPY_D2H);
         model->trace.greedy_token = out;
 
         if (use_cache) {
@@ -1260,7 +1308,20 @@ __export int64_t llaisysQwen2ModelInferCached(
     if (!data) {
         return -1;
     }
-    return qwen2_model_infer_impl(model, data, shape[0], true);
+    if (model->device == LLAISYS_DEVICE_CPU) {
+        return qwen2_model_infer_impl(model, data, shape[0], true);
+    }
+    try {
+        std::vector<int64_t> host_tokens(shape[0]);
+        copy_tensor_bytes(
+            model, host_tokens.data(), data,
+            shape[0] * sizeof(int64_t), LLAISYS_MEMCPY_D2H);
+        return qwen2_model_infer_impl(
+            model, host_tokens.data(), host_tokens.size(), true);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[infer-cached] exception caught: %s\n", e.what());
+        return -999;
+    }
 }
 
 __export int llaisysQwen2ModelResetCache(LlaisysQwen2Model *model) {

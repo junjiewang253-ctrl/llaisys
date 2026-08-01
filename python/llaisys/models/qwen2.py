@@ -14,7 +14,13 @@ except Exception as e:  # pragma: no cover
     torch = None
     _TORCH_IMPORT_ERROR = e
 
-from llaisys.libllaisys import LIB_LLAISYS as lib, check_last_error
+from llaisys.libllaisys import (
+    LIB_LLAISYS as lib,
+    DeviceType,
+    MemcpyKind,
+    check_last_error,
+)
+from llaisys.runtime import RuntimeAPI
 from llaisys.libllaisys.models.qwen2 import (
     LlaisysQwen2Meta,
     LlaisysQwen2Trace,
@@ -24,6 +30,7 @@ from llaisys.libllaisys.models.qwen2 import (
 
 # ---- enums: 跟 llaisys.h / llaisys_types.py 对齐 ----
 LLAISYS_DEVICE_CPU = 0
+LLAISYS_DEVICE_NVIDIA = 1
 
 LLAISYS_DTYPE_I64 = 6
 LLAISYS_DTYPE_F16 = 12
@@ -302,8 +309,22 @@ class Qwen2:
         _set_ctypes_signatures()
 
         self.model_dir = model_dir
-        self.device = LLAISYS_DEVICE_CPU
-        self.device_id = 0
+        requested_device = (device or "cpu").lower().strip()
+        if requested_device == "cpu":
+            self.device = LLAISYS_DEVICE_CPU
+            self.device_id = 0
+        elif requested_device in ("cuda", "nvidia"):
+            self.device = LLAISYS_DEVICE_NVIDIA
+            self.device_id = 0
+        elif requested_device.startswith("cuda:"):
+            self.device = LLAISYS_DEVICE_NVIDIA
+            self.device_id = int(requested_device.split(":", 1)[1])
+            if self.device_id < 0:
+                raise ValueError(f"invalid CUDA device id: {self.device_id}")
+        else:
+            raise ValueError(
+                f"Unsupported device='{device}', expected cpu/cuda/cuda:<id>/nvidia"
+            )
 
         self._weight_map = _build_weight_map(model_dir)
 
@@ -334,7 +355,14 @@ class Qwen2:
         meta.end_token = int(cfg.eos_token_id)
 
         self.meta = meta
-        self._model: LlaisysQwen2Model_p = lib.llaisysQwen2ModelCreate(ctypes.byref(meta), self.device, None, 0)
+        device_ids = None
+        ndevice = 0
+        if self.device == LLAISYS_DEVICE_NVIDIA:
+            device_ids = (ctypes.c_int * 1)(self.device_id)
+            ndevice = 1
+        self._model: LlaisysQwen2Model_p = lib.llaisysQwen2ModelCreate(
+            ctypes.byref(meta), self.device, device_ids, ndevice
+        )
         check_last_error()
         if not self._model:
             raise RuntimeError("llaisysQwen2ModelCreate failed")
@@ -473,9 +501,17 @@ class Qwen2:
         result = torch.empty(shape, dtype=torch_dtype)
         source = lib.tensorGetData(handle)
         check_last_error()
-        ctypes.memmove(
-            result.data_ptr(), source, result.numel() * result.element_size()
-        )
+        device_type = int(lib.tensorGetDeviceType(handle))
+        check_last_error()
+        size = result.numel() * result.element_size()
+        if device_type == LLAISYS_DEVICE_CPU:
+            ctypes.memmove(result.data_ptr(), source, size)
+        elif device_type == LLAISYS_DEVICE_NVIDIA:
+            RuntimeAPI(DeviceType.NVIDIA).memcpy_sync(
+                result.data_ptr(), source, size, MemcpyKind.D2H
+            )
+        else:
+            raise RuntimeError(f"unsupported trace device type: {device_type}")
         return result
 
     def forward_trace(self, token_ids):

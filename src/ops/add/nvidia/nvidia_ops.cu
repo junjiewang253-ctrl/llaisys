@@ -1,10 +1,12 @@
 #include "nvidia_ops.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -18,6 +20,14 @@ void checkCuda(cudaError_t status, const char *operation) {
     if (status != cudaSuccess) {
         throw std::runtime_error(
             std::string(operation) + ": " + cudaGetErrorString(status));
+    }
+}
+
+void checkCublas(cublasStatus_t status, const char *operation) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            std::string(operation) + ": cuBLAS status " +
+            std::to_string(static_cast<int>(status)));
     }
 }
 
@@ -139,6 +149,15 @@ __global__ void llaisys_cuda_linear_kernel(
 }
 
 template <typename T>
+__global__ void llaisys_cuda_linear_bias_kernel(
+    T *out, const T *bias, size_t count, size_t columns) {
+    const size_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+    if (linear < count) {
+        out[linear] = bias[linear % columns];
+    }
+}
+
+template <typename T>
 __global__ void llaisys_cuda_rms_norm_kernel(
     T *out, const T *input, const T *weight, size_t m, size_t d, float eps) {
     const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -185,7 +204,8 @@ __global__ void llaisys_cuda_swiglu_kernel(
     if (index >= count) return;
     const float g = toFloat(gate[index]);
     const float u = toFloat(up[index]);
-    out[index] = fromFloat<T>(u * g / (1.0f + expf(-g)));
+    const float silu = dtypeRound<T>(g / (1.0f + expf(-g)));
+    out[index] = fromFloat<T>(u * silu);
 }
 
 template <typename T>
@@ -277,16 +297,50 @@ void launchEmbedding(std::byte *out, const std::byte *index,
 }
 
 template <typename T>
+cudaDataType_t cudaDataType();
+template <> cudaDataType_t cudaDataType<float>() { return CUDA_R_32F; }
+template <> cudaDataType_t cudaDataType<__half>() { return CUDA_R_16F; }
+template <> cudaDataType_t cudaDataType<__nv_bfloat16>() { return CUDA_R_16BF; }
+
+template <typename T>
 void launchLinear(std::byte *out, const std::byte *input,
                   const std::byte *weight, const std::byte *bias,
                   size_t m, size_t k, size_t n, bool has_bias,
                   cudaStream_t stream) {
     const size_t count = m * n;
     if (count == 0) return;
-    llaisys_cuda_linear_kernel<<<blocks(count), BLOCK, 0, stream>>>(
-        reinterpret_cast<T *>(out), reinterpret_cast<const T *>(input),
-        reinterpret_cast<const T *>(weight), reinterpret_cast<const T *>(bias),
-        m, k, n, has_bias);
+    if (m > static_cast<size_t>(INT_MAX) ||
+        k > static_cast<size_t>(INT_MAX) ||
+        n > static_cast<size_t>(INT_MAX)) {
+        throw std::invalid_argument("CUDA linear dimension exceeds cuBLAS int range");
+    }
+    if (has_bias) {
+        llaisys_cuda_linear_bias_kernel<<<blocks(count), BLOCK, 0, stream>>>(
+            reinterpret_cast<T *>(out), reinterpret_cast<const T *>(bias),
+            count, n);
+        checkCuda(cudaPeekAtLastError(), "CUDA linear bias launch");
+    }
+    cublasHandle_t handle = nullptr;
+    checkCublas(cublasCreate(&handle), "cublasCreate");
+    try {
+        checkCublas(cublasSetStream(handle, stream), "cublasSetStream");
+        const float alpha = 1.0f;
+        const float beta = has_bias ? 1.0f : 0.0f;
+        const auto data_type = cudaDataType<T>();
+        checkCublas(
+            cublasGemmEx(
+                handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
+                &alpha, weight, data_type, static_cast<int>(k),
+                input, data_type, static_cast<int>(k),
+                &beta, out, data_type, static_cast<int>(n),
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            "cublasGemmEx");
+    } catch (...) {
+        cublasDestroy(handle);
+        throw;
+    }
+    checkCublas(cublasDestroy(handle), "cublasDestroy");
 }
 
 template <typename T>
