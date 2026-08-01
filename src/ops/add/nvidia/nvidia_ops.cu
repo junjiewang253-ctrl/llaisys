@@ -160,15 +160,50 @@ __global__ void llaisys_cuda_linear_bias_kernel(
 template <typename T>
 __global__ void llaisys_cuda_rms_norm_kernel(
     T *out, const T *input, const T *weight, size_t m, size_t d, float eps) {
-    const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= m) return;
-    float sum = 0.0f;
-    for (size_t column = 0; column < d; ++column) {
-        const float value = toFloat(input[row * d + column]);
-        sum += value * value;
+    const size_t row = blockIdx.x;
+    __shared__ float partial[BLOCK];
+    float accumulators[4] = {};
+    if (row < m) {
+        const size_t vector_count = d / 4;
+        for (size_t vector = threadIdx.x; vector < vector_count;
+             vector += blockDim.x) {
+#pragma unroll
+            for (size_t lane = 0; lane < 4; ++lane) {
+                const float value = toFloat(
+                    input[row * d + vector * 4 + lane]);
+                accumulators[lane] += value * value;
+            }
+        }
+        const size_t tail = vector_count * 4 + threadIdx.x;
+        if (tail < d) {
+            const float value = toFloat(input[row * d + tail]);
+            accumulators[0] += value * value;
+        }
     }
-    const float inverse = rsqrtf(sum / static_cast<float>(d) + eps);
-    for (size_t column = 0; column < d; ++column) {
+    float sum = accumulators[0] + accumulators[1];
+    sum += accumulators[2];
+    sum += accumulators[3];
+    partial[threadIdx.x] = sum;
+    for (unsigned int offset = blockDim.x / 2; offset >= 32; offset /= 2) {
+        __syncthreads();
+        if (threadIdx.x < offset) {
+            sum += partial[threadIdx.x + offset];
+            partial[threadIdx.x] = sum;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+#pragma unroll
+        for (unsigned int offset = 1; offset < 32; offset *= 2) {
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }
+        if (threadIdx.x == 0) partial[0] = sum;
+    }
+    __syncthreads();
+    if (row >= m) return;
+    const float inverse = rsqrtf(
+        partial[0] / static_cast<float>(d) + eps);
+    for (size_t column = threadIdx.x; column < d; column += blockDim.x) {
         float normalized = toFloat(input[row * d + column]) * inverse;
         normalized = dtypeRound<T>(normalized);
         out[row * d + column] = fromFloat<T>(
@@ -348,7 +383,7 @@ void launchRmsNorm(std::byte *out, const std::byte *input,
                    const std::byte *weight, size_t m, size_t d, float eps,
                    cudaStream_t stream) {
     if (m == 0) return;
-    llaisys_cuda_rms_norm_kernel<<<blocks(m), BLOCK, 0, stream>>>(
+    llaisys_cuda_rms_norm_kernel<<<m, 128, 0, stream>>>(
         reinterpret_cast<T *>(out), reinterpret_cast<const T *>(input),
         reinterpret_cast<const T *>(weight), m, d, eps);
 }
