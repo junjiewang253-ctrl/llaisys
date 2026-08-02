@@ -5,6 +5,39 @@
 <a href="README_ZN.md" target="README_ZN.md">中文</a>
 </p>
 
+## 本 Fork 当前状态
+
+本 fork 保存了 LLAISYS → InfiniLM PerfGuard 项目的
+`integration/m2-m6` 开发历史。经验证的实现基线为：
+
+```text
+分支：integration/m2-m6
+提交：a56a71ec930a1d063c722e6325c9dbcfbdf72c21
+状态：LOCAL_GATE_PASS / AUDIT_PENDING
+```
+
+该分支通过普通 merge 保留了官方基线和用户早期 fork 历史，已实现并验证：
+
+- Runtime、Tensor、所有权、view/stride 和 C ABI 错误边界；
+- CPU 算子和 Qwen2 CPU 推理；
+- KV Cache prefill/decode、reset/reuse 和分配量核算；
+- NVIDIA Runtime 和 CUDA 算子；
+- Qwen2-0.5B CPU/CUDA、cache/no-cache 四路正确性；
+- CUDA 内存、竞态、初始化、同步 sanitizer 和定向 Nsight trace。
+
+M6-B 最终不可变收尾共执行 67 条命令，67 条 true exit 全部为 0。
+正确性模型固定为 Apache-2.0 的
+`Qwen/Qwen2-0.5B-Instruct@5d7fcd0489cec614eada4fb067e18a019683b178`。
+模型权重、虚拟环境、构建产物、缓存和 profiler 二进制不进入本仓库。
+
+这是正确性本地门结果，不是性能或生产环境结论。当前仍等待独立
+campaign audit，多卡/NCCL/TP 和容量实验属于独立的项目控制仓库：
+[junjiewang253-ctrl/llaisys-infinilm-private](https://github.com/junjiewang253-ctrl/llaisys-infinilm-private)。
+
+后续开发应从 `integration/m2-m6` 新建分支。上述 `a56a71e` 始终作为本次
+correctness 实验身份；其后的纯文档提交不改变该身份。远端 `main` 保留为
+campaign 前的 fork 基线，等独立审计后再通过普通 PR/merge 合入。
+
 ## 简介
 
 LLAISYS（Let's Learn AI SYStem）是一个教育项目，旨在为新手和未来的 AI 工程师提供一个从零开始构建 AI 系统的学习平台。LLAISYS 包含多个帮助学生学习和构建基础模块的作业，以及面向通过考核并获准晋级学员的项目阶段。LLAISYS使用C++作为系统后端的主要编程语言，并编译成共享库，提供C语言API。前端代码使用Python编写，调用这些API以提供更便捷的测试和与其他架构（如PyTorch）的交互。
