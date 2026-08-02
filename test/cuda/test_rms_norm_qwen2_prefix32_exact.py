@@ -64,6 +64,10 @@ def main():
     else:
         source = trace["diagnostic_post_attention"]
         weight = weights[f"model.layers.{layer}.post_attention_layernorm.weight"]
+    row_text = os.environ.get("LLAISYS_M6B_RMS_ROW", "")
+    if row_text:
+        row = int(row_text)
+        source = source[row : row + 1]
     source_cuda = source.cuda()
     weight_cuda = weight.cuda()
     source_float = source_cuda.float()
@@ -90,6 +94,9 @@ def main():
     maximum = float(delta.max())
     pow_mul_mismatches = int((expected != expected_mul).sum())
     actual_mul_mismatches = int((actual != expected_mul).sum())
+    mismatch_rows = torch.nonzero(
+        (actual != expected).reshape(actual.shape[0], -1).any(dim=1)
+    ).reshape(-1).tolist()
     print(
         f"{prompt_id}_length{len(tokens)}_layer{layer}_{boundary}_rms "
         f"mismatches={mismatches} max_abs={maximum}"
@@ -98,6 +105,7 @@ def main():
         f"pow_vs_mul_mismatches={pow_mul_mismatches} "
         f"actual_vs_mul_mismatches={actual_mul_mismatches}"
     )
+    print(f"mismatch_rows={mismatch_rows}")
     assert mismatches == 0
     print("QWEN2_RMS_NORM_EXACT_PASS")
 
