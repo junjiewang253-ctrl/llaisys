@@ -48,6 +48,9 @@ def main():
     )
     if prefix_text:
         tokens = tokens[: int(prefix_text)]
+    append_text = os.environ.get("LLAISYS_M6B_RMS_APPEND_TOKENS", "")
+    if append_text:
+        tokens.extend(int(token) for token in append_text.split(","))
     layer = int(os.environ.get("LLAISYS_M6B_RMS_LAYER", "22"))
     boundary = os.environ.get("LLAISYS_M6B_RMS_BOUNDARY", "mlp")
     assert boundary in {"attn", "mlp"}

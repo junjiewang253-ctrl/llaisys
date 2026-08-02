@@ -62,6 +62,9 @@ def main():
     ))
     if prefix_text:
         tokens = tokens[: int(prefix_text)]
+    append_text = os.environ.get("LLAISYS_M6B_DIAGNOSTIC_APPEND_TOKENS", "")
+    if append_text:
+        tokens.extend(int(token) for token in append_text.split(","))
     reference = AutoModelForCausalLM.from_pretrained(
         root, local_files_only=True, trust_remote_code=False,
         torch_dtype=torch.bfloat16, attn_implementation="eager",
