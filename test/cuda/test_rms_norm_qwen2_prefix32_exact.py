@@ -66,10 +66,15 @@ def main():
         weight = weights[f"model.layers.{layer}.post_attention_layernorm.weight"]
     source_cuda = source.cuda()
     weight_cuda = weight.cuda()
-    normalized = source_cuda.float() * torch.rsqrt(
-        source_cuda.float().pow(2).mean(-1, keepdim=True) + 1e-6
+    source_float = source_cuda.float()
+    normalized = source_float * torch.rsqrt(
+        source_float.pow(2).mean(-1, keepdim=True) + 1e-6
     )
     expected = (normalized.to(torch.bfloat16) * weight_cuda).cpu()
+    normalized_mul = source_float * torch.rsqrt(
+        (source_float * source_float).mean(-1, keepdim=True) + 1e-6
+    )
+    expected_mul = (normalized_mul.to(torch.bfloat16) * weight_cuda).cpu()
     source_ll = llaisys_tensor(source, llaisys.DeviceType.NVIDIA)
     weight_ll = llaisys_tensor(weight, llaisys.DeviceType.NVIDIA)
     output_ll = llaisys.Tensor(
@@ -83,9 +88,15 @@ def main():
     delta = (actual.float() - expected.float()).abs()
     mismatches = int((actual != expected).sum())
     maximum = float(delta.max())
+    pow_mul_mismatches = int((expected != expected_mul).sum())
+    actual_mul_mismatches = int((actual != expected_mul).sum())
     print(
         f"{prompt_id}_length{len(tokens)}_layer{layer}_{boundary}_rms "
         f"mismatches={mismatches} max_abs={maximum}"
+    )
+    print(
+        f"pow_vs_mul_mismatches={pow_mul_mismatches} "
+        f"actual_vs_mul_mismatches={actual_mul_mismatches}"
     )
     assert mismatches == 0
     print("QWEN2_RMS_NORM_EXACT_PASS")
