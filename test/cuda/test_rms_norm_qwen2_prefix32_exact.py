@@ -49,12 +49,18 @@ def main():
     if prefix_text:
         tokens = tokens[: int(prefix_text)]
     layer = int(os.environ.get("LLAISYS_M6B_RMS_LAYER", "22"))
+    boundary = os.environ.get("LLAISYS_M6B_RMS_BOUNDARY", "mlp")
+    assert boundary in {"attn", "mlp"}
     os.environ["LLAISYS_QWEN2_TRACE_LAYER"] = str(layer)
     model = llaisys.Qwen2(str(model_dir), device="cuda", dtype="bf16")
-    source = model.forward_trace(tokens)["diagnostic_post_attention"]
-    weight = load_file(model_dir / "model.safetensors")[
-        f"model.layers.{layer}.post_attention_layernorm.weight"
-    ]
+    trace = model.forward_trace(tokens)
+    weights = load_file(model_dir / "model.safetensors")
+    if boundary == "attn":
+        source = trace["embedding"] if layer == 0 else trace[f"layer.{layer - 1}.output"]
+        weight = weights[f"model.layers.{layer}.input_layernorm.weight"]
+    else:
+        source = trace["diagnostic_post_attention"]
+        weight = weights[f"model.layers.{layer}.post_attention_layernorm.weight"]
     source_cuda = source.cuda()
     weight_cuda = weight.cuda()
     normalized = source_cuda.float() * torch.rsqrt(
@@ -75,7 +81,7 @@ def main():
     mismatches = int((actual != expected).sum())
     maximum = float(delta.max())
     print(
-        f"{prompt_id}_length{len(tokens)}_layer{layer}_mlp_rms "
+        f"{prompt_id}_length{len(tokens)}_layer{layer}_{boundary}_rms "
         f"mismatches={mismatches} max_abs={maximum}"
     )
     assert mismatches == 0
