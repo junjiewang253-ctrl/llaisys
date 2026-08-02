@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact CUDA RMSNorm fixture from Qwen2 prefix-32 layer 22."""
+"""Exact CUDA RMSNorm fixture from a frozen Qwen2 trace boundary."""
 
 import os
 from pathlib import Path
@@ -22,19 +22,33 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         model_dir, local_files_only=True, trust_remote_code=False
     )
-    message = {
-        "role": "user",
-        "content": (
-            "Count from one to ten in English, separated by commas, and then "
-            "explain in one sentence why ten follows nine."
-        ),
+    prompts = {
+        "P1": {"role": "user", "content": "你好，请用一句话介绍你自己。"},
+        "P2": {
+            "role": "user",
+            "content": "What is 17 plus 25? Answer with only the number.",
+        },
+        "P3": {
+            "role": "user",
+            "content": (
+                "Count from one to ten in English, separated by commas, and then "
+                "explain in one sentence why ten follows nine."
+            ),
+        },
     }
+    prompt_id = os.environ.get("LLAISYS_M6B_RMS_PROMPT", "P3")
+    message = prompts[prompt_id]
+    prefix_text = os.environ.get(
+        "LLAISYS_M6B_RMS_PREFIX", "32" if prompt_id == "P3" else ""
+    )
     tokens = list(
         tokenizer.apply_chat_template(
             [message], tokenize=True, add_generation_prompt=True
         )
-    )[:32]
-    layer = 22
+    )
+    if prefix_text:
+        tokens = tokens[: int(prefix_text)]
+    layer = int(os.environ.get("LLAISYS_M6B_RMS_LAYER", "22"))
     os.environ["LLAISYS_QWEN2_TRACE_LAYER"] = str(layer)
     model = llaisys.Qwen2(str(model_dir), device="cuda", dtype="bf16")
     source = model.forward_trace(tokens)["diagnostic_post_attention"]
@@ -61,10 +75,11 @@ def main():
     mismatches = int((actual != expected).sum())
     maximum = float(delta.max())
     print(
-        f"prefix32_layer22_mlp_rms mismatches={mismatches} max_abs={maximum}"
+        f"{prompt_id}_length{len(tokens)}_layer{layer}_mlp_rms "
+        f"mismatches={mismatches} max_abs={maximum}"
     )
     assert mismatches == 0
-    print("QWEN2_PREFIX32_RMS_NORM_EXACT_PASS")
+    print("QWEN2_RMS_NORM_EXACT_PASS")
 
 
 if __name__ == "__main__":
