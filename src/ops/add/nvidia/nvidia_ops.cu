@@ -1,5 +1,6 @@
 #include "nvidia_ops.hpp"
 
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace llaisys::ops::nvidia {
 namespace {
@@ -40,6 +42,13 @@ cudaStream_t cudaStream(llaisysStream_t stream) {
 
 unsigned int blocks(size_t count) {
     return static_cast<unsigned int>((count + BLOCK - 1) / BLOCK);
+}
+
+uint32_t pointerAlignment(const void *pointer) {
+    const auto address = reinterpret_cast<uintptr_t>(pointer);
+    uint32_t alignment = 256;
+    while (alignment > 1 && address % alignment != 0) alignment /= 2;
+    return alignment;
 }
 
 template <typename T> __device__ float toFloat(T value);
@@ -341,6 +350,124 @@ template <> cudaDataType_t cudaDataType<float>() { return CUDA_R_32F; }
 template <> cudaDataType_t cudaDataType<__half>() { return CUDA_R_16F; }
 template <> cudaDataType_t cudaDataType<__nv_bfloat16>() { return CUDA_R_16BF; }
 
+void launchLinearBiasBf16Lt(
+    __nv_bfloat16 *out, const __nv_bfloat16 *input,
+    const __nv_bfloat16 *weight, const __nv_bfloat16 *bias,
+    size_t m, size_t k, size_t n, cudaStream_t stream) {
+    cublasLtHandle_t handle = nullptr;
+    cublasLtMatmulDesc_t operation = nullptr;
+    cublasLtMatrixLayout_t weight_layout = nullptr;
+    cublasLtMatrixLayout_t input_layout = nullptr;
+    cublasLtMatrixLayout_t output_layout = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
+    void *workspace = nullptr;
+    constexpr size_t workspace_bytes = 1024 * 1024;
+    auto cleanup = [&]() {
+        if (workspace != nullptr) cudaFreeAsync(workspace, stream);
+        if (preference != nullptr) cublasLtMatmulPreferenceDestroy(preference);
+        if (output_layout != nullptr) cublasLtMatrixLayoutDestroy(output_layout);
+        if (input_layout != nullptr) cublasLtMatrixLayoutDestroy(input_layout);
+        if (weight_layout != nullptr) cublasLtMatrixLayoutDestroy(weight_layout);
+        if (operation != nullptr) cublasLtMatmulDescDestroy(operation);
+        if (handle != nullptr) cublasLtDestroy(handle);
+    };
+    try {
+        checkCublas(cublasLtCreate(&handle), "cublasLtCreate");
+        checkCublas(
+            cublasLtMatmulDescCreate(
+                &operation, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+            "cublasLtMatmulDescCreate");
+        const cublasOperation_t transpose = CUBLAS_OP_T;
+        const cublasOperation_t identity = CUBLAS_OP_N;
+        checkCublas(
+            cublasLtMatmulDescSetAttribute(
+                operation, CUBLASLT_MATMUL_DESC_TRANSA,
+                &transpose, sizeof(transpose)),
+            "cublasLtMatmulDescSetAttribute TRANSA");
+        checkCublas(
+            cublasLtMatmulDescSetAttribute(
+                operation, CUBLASLT_MATMUL_DESC_TRANSB,
+                &identity, sizeof(identity)),
+            "cublasLtMatmulDescSetAttribute TRANSB");
+        const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+        checkCublas(
+            cublasLtMatmulDescSetAttribute(
+                operation, CUBLASLT_MATMUL_DESC_EPILOGUE,
+                &epilogue, sizeof(epilogue)),
+            "cublasLtMatmulDescSetAttribute EPILOGUE");
+        const void *bias_pointer = bias;
+        checkCublas(
+            cublasLtMatmulDescSetAttribute(
+                operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                &bias_pointer, sizeof(bias_pointer)),
+            "cublasLtMatmulDescSetAttribute BIAS_POINTER");
+        checkCublas(
+            cublasLtMatrixLayoutCreate(
+                &weight_layout, CUDA_R_16BF, k, n, k),
+            "cublasLtMatrixLayoutCreate weight");
+        checkCublas(
+            cublasLtMatrixLayoutCreate(
+                &input_layout, CUDA_R_16BF, k, m, k),
+            "cublasLtMatrixLayoutCreate input");
+        checkCublas(
+            cublasLtMatrixLayoutCreate(
+                &output_layout, CUDA_R_16BF, n, m, n),
+            "cublasLtMatrixLayoutCreate output");
+        checkCublas(
+            cublasLtMatmulPreferenceCreate(&preference),
+            "cublasLtMatmulPreferenceCreate");
+        checkCublas(
+            cublasLtMatmulPreferenceSetAttribute(
+                preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &workspace_bytes, sizeof(workspace_bytes)),
+            "cublasLtMatmulPreferenceSetAttribute workspace");
+        const struct {
+            cublasLtMatmulPreferenceAttributes_t attribute;
+            const void *pointer;
+        } alignments[] = {
+            {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, weight},
+            {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, input},
+            {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, out},
+            {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, out},
+        };
+        for (const auto &entry : alignments) {
+            const uint32_t alignment = pointerAlignment(entry.pointer);
+            checkCublas(
+                cublasLtMatmulPreferenceSetAttribute(
+                    preference, entry.attribute,
+                    &alignment, sizeof(alignment)),
+                "cublasLtMatmulPreferenceSetAttribute alignment");
+        }
+        cublasLtMatmulHeuristicResult_t heuristic{};
+        int returned = 0;
+        checkCublas(
+            cublasLtMatmulAlgoGetHeuristic(
+                handle, operation, weight_layout, input_layout,
+                output_layout, output_layout, preference, 1,
+                &heuristic, &returned),
+            "cublasLtMatmulAlgoGetHeuristic");
+        if (returned != 1) {
+            throw std::runtime_error("no cuBLASLt BF16 biased linear algorithm");
+        }
+        checkCuda(
+            cudaMallocAsync(&workspace, workspace_bytes, stream),
+            "cudaMallocAsync cuBLASLt linear workspace");
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        checkCublas(
+            cublasLtMatmul(
+                handle, operation, &alpha,
+                weight, weight_layout, input, input_layout,
+                &beta, out, output_layout, out, output_layout,
+                &heuristic.algo, workspace, workspace_bytes, stream),
+            "cublasLtMatmul BF16 biased linear");
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    cleanup();
+}
+
 template <typename T>
 void launchLinear(std::byte *out, const std::byte *input,
                   const std::byte *weight, const std::byte *bias,
@@ -352,6 +479,16 @@ void launchLinear(std::byte *out, const std::byte *input,
         k > static_cast<size_t>(INT_MAX) ||
         n > static_cast<size_t>(INT_MAX)) {
         throw std::invalid_argument("CUDA linear dimension exceeds cuBLAS int range");
+    }
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        if (has_bias) {
+            launchLinearBiasBf16Lt(
+                reinterpret_cast<T *>(out),
+                reinterpret_cast<const T *>(input),
+                reinterpret_cast<const T *>(weight),
+                reinterpret_cast<const T *>(bias), m, k, n, stream);
+            return;
+        }
     }
     if (has_bias) {
         llaisys_cuda_linear_bias_kernel<<<blocks(count), BLOCK, 0, stream>>>(
