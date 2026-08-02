@@ -40,17 +40,28 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         root, local_files_only=True, trust_remote_code=False
     )
-    message = {
-        "role": "user",
-        "content": (
-            "Count from one to ten in English, separated by commas, and then "
-            "explain in one sentence why ten follows nine."
-        ),
+    prompts = {
+        "P1": {"role": "user", "content": "你好，请用一句话介绍你自己。"},
+        "P2": {
+            "role": "user",
+            "content": "What is 17 plus 25? Answer with only the number.",
+        },
+        "P3": {
+            "role": "user",
+            "content": (
+                "Count from one to ten in English, separated by commas, and then "
+                "explain in one sentence why ten follows nine."
+            ),
+        },
     }
-    prefix_length = int(os.environ.get("LLAISYS_M6B_DIAGNOSTIC_PREFIX", "1"))
+    prompt_id = os.environ.get("LLAISYS_M6B_DIAGNOSTIC_PROMPT", "P3")
+    message = prompts[prompt_id]
+    prefix_text = os.environ.get("LLAISYS_M6B_DIAGNOSTIC_PREFIX", "1")
     tokens = list(tokenizer.apply_chat_template(
         [message], tokenize=True, add_generation_prompt=True
-    ))[:prefix_length]
+    ))
+    if prefix_text:
+        tokens = tokens[: int(prefix_text)]
     reference = AutoModelForCausalLM.from_pretrained(
         root, local_files_only=True, trust_remote_code=False,
         torch_dtype=torch.bfloat16, attn_implementation="eager",
@@ -181,7 +192,7 @@ def main():
         )
     print(json.dumps({
         "role": "diagnostic_only",
-        "case": f"P3-prefix-{len(tokens)}",
+        "case": prompt_id if not prefix_text else f"{prompt_id}-prefix-{len(tokens)}",
         "layer": layer_id,
         "atol": 0.03,
         "rtol": 0.03,
