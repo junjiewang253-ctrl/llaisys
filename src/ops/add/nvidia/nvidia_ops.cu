@@ -44,6 +44,22 @@ unsigned int blocks(size_t count) {
     return static_cast<unsigned int>((count + BLOCK - 1) / BLOCK);
 }
 
+size_t checkedMultiply(size_t left, size_t right, const char *operation) {
+    if (left != 0 && right > SIZE_MAX / left) {
+        throw std::invalid_argument(
+            std::string(operation) + " size overflow");
+    }
+    return left * right;
+}
+
+size_t checkedAdd(size_t left, size_t right, const char *operation) {
+    if (right > SIZE_MAX - left) {
+        throw std::invalid_argument(
+            std::string(operation) + " size overflow");
+    }
+    return left + right;
+}
+
 uint32_t pointerAlignment(const void *pointer) {
     const auto address = reinterpret_cast<uintptr_t>(pointer);
     uint32_t alignment = 256;
@@ -168,36 +184,43 @@ __global__ void llaisys_cuda_linear_bias_kernel(
 
 template <typename T>
 __global__ void llaisys_cuda_rms_norm_kernel(
-    T *out, const T *input, const T *weight, size_t m, size_t d, float eps) {
-    const size_t row = blockIdx.x;
-    __shared__ float partial[BLOCK];
+    T *out, const T *input, const T *weight, size_t m, size_t d,
+    float mean_factor, float eps) {
+    const size_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    const unsigned int partial_index =
+        threadIdx.y * blockDim.x + threadIdx.x;
+    const unsigned int partial_base = threadIdx.y * blockDim.x;
+    __shared__ float partial[512];
     float accumulators[4] = {};
     if (row < m) {
         const size_t vector_count = d / 4;
         for (size_t vector = threadIdx.x; vector < vector_count;
              vector += blockDim.x) {
 #pragma unroll
-            for (size_t lane = 0; lane < 4; ++lane) {
+            for (size_t component = 0; component < 4; ++component) {
                 const float value = toFloat(
-                    input[row * d + vector * 4 + lane]);
-                accumulators[lane] += value * value;
+                    input[row * d + vector * 4 + component]);
+                const float squared = __fmul_rn(value, value);
+                accumulators[component] =
+                    __fadd_rn(accumulators[component], squared);
             }
         }
         const size_t tail = vector_count * 4 + threadIdx.x;
         if (tail < d) {
             const float value = toFloat(input[row * d + tail]);
-            accumulators[0] += value * value;
+            accumulators[0] = __fadd_rn(
+                accumulators[0], __fmul_rn(value, value));
         }
     }
     float sum = accumulators[0] + accumulators[1];
     sum += accumulators[2];
     sum += accumulators[3];
-    partial[threadIdx.x] = sum;
+    partial[partial_index] = sum;
     for (unsigned int offset = blockDim.x / 2; offset >= 32; offset /= 2) {
         __syncthreads();
         if (threadIdx.x < offset) {
-            sum += partial[threadIdx.x + offset];
-            partial[threadIdx.x] = sum;
+            sum += partial[partial_base + threadIdx.x + offset];
+            partial[partial_index] = sum;
         }
     }
     __syncthreads();
@@ -206,12 +229,13 @@ __global__ void llaisys_cuda_rms_norm_kernel(
         for (unsigned int offset = 1; offset < 32; offset *= 2) {
             sum += __shfl_down_sync(0xffffffff, sum, offset);
         }
-        if (threadIdx.x == 0) partial[0] = sum;
+        if (threadIdx.x == 0) partial[partial_base] = sum;
     }
     __syncthreads();
     if (row >= m) return;
-    const float inverse = rsqrtf(
-        partial[0] / static_cast<float>(d) + eps);
+    const float mean = __fmul_rn(partial[partial_base], mean_factor);
+    const float variance = __fadd_rn(mean, eps);
+    const float inverse = rsqrtf(variance);
     for (size_t column = threadIdx.x; column < d; column += blockDim.x) {
         float normalized = toFloat(input[row * d + column]) * inverse;
         normalized = dtypeRound<T>(normalized);
@@ -305,6 +329,204 @@ __global__ void llaisys_cuda_self_attention_kernel(
             v[(key_index * nkvhead + kv_head) * dv + value_dim]);
     }
     out[linear] = fromFloat<T>(result);
+}
+
+template <typename T>
+__global__ void llaisys_cuda_attention_softmax_kernel(
+    T *probabilities, size_t seqlen, size_t total_len, float scale) {
+    const size_t token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= seqlen) return;
+    const size_t max_key = token + total_len - seqlen;
+    T *row = probabilities + token * total_len;
+    float maximum = -INFINITY;
+    for (size_t key = 0; key <= max_key; ++key) {
+        const float logit = dtypeRound<T>(toFloat(row[key]) * scale);
+        row[key] = fromFloat<T>(logit);
+        maximum = fmaxf(maximum, logit);
+    }
+    float denominator = 0.0f;
+    for (size_t key = 0; key <= max_key; ++key) {
+        denominator += expf(toFloat(row[key]) - maximum);
+    }
+    for (size_t key = 0; key <= max_key; ++key) {
+        row[key] = fromFloat<T>(
+            expf(toFloat(row[key]) - maximum) / denominator);
+    }
+    for (size_t key = max_key + 1; key < total_len; ++key) {
+        row[key] = fromFloat<T>(0.0f);
+    }
+}
+
+template <typename T, int LOG2_ELEMENTS>
+__global__ void llaisys_cuda_attention_softmax_warp_kernel(
+    T *probabilities, size_t seqlen, size_t total_len, float scale) {
+    constexpr int next_power_of_two = 1 << LOG2_ELEMENTS;
+    constexpr int warp_size = next_power_of_two < 32 ? next_power_of_two : 32;
+    constexpr int warp_iterations = next_power_of_two / warp_size;
+    constexpr int warp_batch = next_power_of_two <= 128 ? 2 : 1;
+
+    const size_t first_token =
+        (blockDim.y * blockIdx.x + threadIdx.y) * warp_batch;
+    const size_t local_index = threadIdx.x;
+    const size_t remaining_tokens =
+        first_token < seqlen ? seqlen - first_token : 0;
+    const size_t local_tokens =
+        remaining_tokens < static_cast<size_t>(warp_batch)
+            ? remaining_tokens
+            : static_cast<size_t>(warp_batch);
+    float elements[warp_batch][warp_iterations];
+
+#pragma unroll
+    for (int batch = 0; batch < warp_batch; ++batch) {
+        const size_t token = first_token + batch;
+        const size_t max_key = token + total_len - seqlen;
+#pragma unroll
+        for (int iteration = 0; iteration < warp_iterations; ++iteration) {
+            const size_t key = local_index + iteration * warp_size;
+            if (static_cast<size_t>(batch) < local_tokens &&
+                key < total_len && key <= max_key) {
+                T *row = probabilities + token * total_len;
+                elements[batch][iteration] =
+                    dtypeRound<T>(toFloat(row[key]) * scale);
+            } else {
+                elements[batch][iteration] = -INFINITY;
+            }
+        }
+    }
+
+    float maximum[warp_batch];
+#pragma unroll
+    for (int batch = 0; batch < warp_batch; ++batch) {
+        maximum[batch] = elements[batch][0];
+#pragma unroll
+        for (int iteration = 0; iteration < warp_iterations; ++iteration) {
+            maximum[batch] = maximum[batch] > elements[batch][iteration]
+                                 ? maximum[batch]
+                                 : elements[batch][iteration];
+        }
+    }
+#pragma unroll
+    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < warp_batch; ++batch) {
+            const float other = __shfl_xor_sync(
+                0xffffffff, maximum[batch], offset, warp_size);
+            maximum[batch] =
+                maximum[batch] < other ? other : maximum[batch];
+        }
+    }
+
+    float denominator[warp_batch] = {};
+#pragma unroll
+    for (int batch = 0; batch < warp_batch; ++batch) {
+#pragma unroll
+        for (int iteration = 0; iteration < warp_iterations; ++iteration) {
+            elements[batch][iteration] =
+                expf(elements[batch][iteration] - maximum[batch]);
+            denominator[batch] += elements[batch][iteration];
+        }
+    }
+#pragma unroll
+    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+#pragma unroll
+        for (int batch = 0; batch < warp_batch; ++batch) {
+            denominator[batch] += __shfl_xor_sync(
+                0xffffffff, denominator[batch], offset, warp_size);
+        }
+    }
+
+#pragma unroll
+    for (int batch = 0; batch < warp_batch; ++batch) {
+        if (static_cast<size_t>(batch) >= local_tokens) break;
+        T *row = probabilities + (first_token + batch) * total_len;
+#pragma unroll
+        for (int iteration = 0; iteration < warp_iterations; ++iteration) {
+            const size_t key = local_index + iteration * warp_size;
+            if (key < total_len) {
+                row[key] = fromFloat<T>(
+                    elements[batch][iteration] / denominator[batch]);
+            }
+        }
+    }
+}
+
+template <typename T, int LOG2_ELEMENTS>
+void launchAttentionSoftmaxWarp(
+    T *probabilities, size_t seqlen, size_t total_len, float scale,
+    cudaStream_t stream) {
+    constexpr int next_power_of_two = 1 << LOG2_ELEMENTS;
+    constexpr int warp_size = next_power_of_two < 32 ? next_power_of_two : 32;
+    constexpr int warp_batch = next_power_of_two <= 128 ? 2 : 1;
+    constexpr int threads_per_block = 128;
+    constexpr int warps_per_block = threads_per_block / warp_size;
+    constexpr int tokens_per_block = warps_per_block * warp_batch;
+    const unsigned int block_count = static_cast<unsigned int>(
+        (seqlen + tokens_per_block - 1) / tokens_per_block);
+    const dim3 threads(warp_size, warps_per_block, 1);
+    llaisys_cuda_attention_softmax_warp_kernel<T, LOG2_ELEMENTS>
+        <<<block_count, threads, 0, stream>>>(
+            probabilities, seqlen, total_len, scale);
+}
+
+template <typename T>
+void launchAttentionSoftmax(
+    T *probabilities, size_t seqlen, size_t total_len, float scale,
+    cudaStream_t stream) {
+#define SOFTMAX_CASE(LOG2) \
+    case (static_cast<size_t>(1) << (LOG2)): \
+        launchAttentionSoftmaxWarp<T, LOG2>( \
+            probabilities, seqlen, total_len, scale, stream); \
+        return
+    size_t next_power_of_two = 1;
+    while (next_power_of_two < total_len && next_power_of_two < 1024) {
+        next_power_of_two *= 2;
+    }
+    switch (next_power_of_two) {
+        SOFTMAX_CASE(0);
+        SOFTMAX_CASE(1);
+        SOFTMAX_CASE(2);
+        SOFTMAX_CASE(3);
+        SOFTMAX_CASE(4);
+        SOFTMAX_CASE(5);
+        SOFTMAX_CASE(6);
+        SOFTMAX_CASE(7);
+        SOFTMAX_CASE(8);
+        SOFTMAX_CASE(9);
+        SOFTMAX_CASE(10);
+        default: break;
+    }
+#undef SOFTMAX_CASE
+    llaisys_cuda_attention_softmax_kernel<<<
+        blocks(seqlen), BLOCK, 0, stream>>>(
+            probabilities, seqlen, total_len, scale);
+}
+
+template <typename T>
+__global__ void llaisys_cuda_repeat_kv_heads_kernel(
+    T *out, const T *input, size_t total_len, size_t nhead,
+    size_t nkvhead, size_t width) {
+    const size_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t count = nhead * total_len * width;
+    if (linear >= count) return;
+    const size_t column = linear % width;
+    const size_t head_token = linear / width;
+    const size_t token = head_token % total_len;
+    const size_t head = head_token / total_len;
+    const size_t kv_head = head / (nhead / nkvhead);
+    out[linear] = input[(token * nkvhead + kv_head) * width + column];
+}
+
+template <typename T>
+__global__ void llaisys_cuda_attention_head_to_token_kernel(
+    T *out, const T *input, size_t seqlen, size_t nhead, size_t width) {
+    const size_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t count = seqlen * nhead * width;
+    if (linear >= count) return;
+    const size_t column = linear % width;
+    const size_t head_token = linear / width;
+    const size_t head = head_token % nhead;
+    const size_t token = head_token / nhead;
+    out[linear] = input[(head * seqlen + token) * width + column];
 }
 
 template <typename T>
@@ -524,9 +746,24 @@ void launchRmsNorm(std::byte *out, const std::byte *input,
                    const std::byte *weight, size_t m, size_t d, float eps,
                    cudaStream_t stream) {
     if (m == 0) return;
-    llaisys_cuda_rms_norm_kernel<<<m, 128, 0, stream>>>(
+    unsigned int width = m >= 16 ? 32 : (m >= 8 ? 64 : 128);
+    unsigned int height = 1;
+    if (d > 128) {
+        unsigned int output_power = 1;
+        while (output_power < 16 && output_power * 2 <= m) {
+            output_power *= 2;
+        }
+        height = output_power;
+        width = 512 / height;
+        if (width > 128) width = 128;
+        if (width > 32 && height >= 16) width = 32;
+    }
+    const unsigned int grid =
+        static_cast<unsigned int>((m + height - 1) / height);
+    const float mean_factor = 1.0f / static_cast<float>(d);
+    llaisys_cuda_rms_norm_kernel<<<grid, dim3(width, height), 0, stream>>>(
         reinterpret_cast<T *>(out), reinterpret_cast<const T *>(input),
-        reinterpret_cast<const T *>(weight), m, d, eps);
+        reinterpret_cast<const T *>(weight), m, d, mean_factor, eps);
 }
 
 template <typename T>
@@ -557,10 +794,108 @@ void launchSelfAttention(std::byte *out, const std::byte *q,
                          cudaStream_t stream) {
     const size_t count = seqlen * nhead * dv;
     if (count == 0) return;
-    llaisys_cuda_self_attention_kernel<<<blocks(count), BLOCK, 0, stream>>>(
-        reinterpret_cast<T *>(out), reinterpret_cast<const T *>(q),
-        reinterpret_cast<const T *>(k), reinterpret_cast<const T *>(v),
-        seqlen, nhead, nkvhead, d, dv, total_len, scale);
+    if (seqlen > static_cast<size_t>(INT_MAX) ||
+        total_len > static_cast<size_t>(INT_MAX) ||
+        nhead > static_cast<size_t>(INT_MAX) ||
+        nkvhead > static_cast<size_t>(INT_MAX) ||
+        d > static_cast<size_t>(INT_MAX) ||
+        dv > static_cast<size_t>(INT_MAX) ||
+        nhead % nkvhead != 0 || total_len < seqlen) {
+        throw std::invalid_argument("invalid CUDA attention dimensions");
+    }
+    const size_t repeated_key_count = checkedMultiply(
+        checkedMultiply(nhead, total_len, "CUDA attention repeated key"),
+        d, "CUDA attention repeated key");
+    const size_t repeated_value_count = checkedMultiply(
+        checkedMultiply(nhead, total_len, "CUDA attention repeated value"),
+        dv, "CUDA attention repeated value");
+    const size_t probability_count = checkedMultiply(
+        checkedMultiply(nhead, seqlen, "CUDA attention probabilities"),
+        total_len, "CUDA attention probabilities");
+    const size_t head_output_count = checkedMultiply(
+        checkedMultiply(nhead, seqlen, "CUDA attention head output"),
+        dv, "CUDA attention head output");
+    size_t workspace_count = checkedAdd(
+        repeated_key_count, repeated_value_count, "CUDA attention workspace");
+    workspace_count = checkedAdd(
+        workspace_count, probability_count, "CUDA attention workspace");
+    workspace_count = checkedAdd(
+        workspace_count, head_output_count, "CUDA attention workspace");
+    const size_t workspace_bytes = checkedMultiply(
+        workspace_count, sizeof(T), "CUDA attention workspace");
+    T *workspace = nullptr;
+    checkCuda(
+        cudaMallocAsync(
+            reinterpret_cast<void **>(&workspace), workspace_bytes, stream),
+        "cudaMallocAsync attention workspace");
+    T *repeated_key = workspace;
+    T *repeated_value = repeated_key + repeated_key_count;
+    T *probabilities = repeated_value + repeated_value_count;
+    T *head_output = probabilities + probability_count;
+    llaisys_cuda_repeat_kv_heads_kernel<<<
+        blocks(repeated_key_count), BLOCK, 0, stream>>>(
+        repeated_key, reinterpret_cast<const T *>(k), total_len,
+        nhead, nkvhead, d);
+    llaisys_cuda_repeat_kv_heads_kernel<<<
+        blocks(repeated_value_count), BLOCK, 0, stream>>>(
+        repeated_value, reinterpret_cast<const T *>(v), total_len,
+        nhead, nkvhead, dv);
+    checkCuda(cudaPeekAtLastError(), "CUDA attention repeat KV launch");
+    cublasHandle_t handle = nullptr;
+    try {
+        checkCublas(cublasCreate(&handle), "cublasCreate attention");
+        checkCublas(cublasSetStream(handle, stream), "cublasSetStream attention");
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const auto data_type = cudaDataType<T>();
+        checkCublas(
+            cublasGemmStridedBatchedEx(
+                handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                static_cast<int>(total_len), static_cast<int>(seqlen),
+                static_cast<int>(d), &alpha,
+                repeated_key, data_type, static_cast<int>(d),
+                static_cast<long long>(total_len * d),
+                reinterpret_cast<const T *>(q), data_type,
+                static_cast<int>(nhead * d), static_cast<long long>(d),
+                &beta, probabilities, data_type,
+                static_cast<int>(total_len),
+                static_cast<long long>(seqlen * total_len),
+                static_cast<int>(nhead), CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            "cublasGemmStridedBatchedEx attention QK");
+        for (size_t head = 0; head < nhead; ++head) {
+            launchAttentionSoftmax(
+                probabilities + head * seqlen * total_len,
+                seqlen, total_len, scale, stream);
+        }
+        checkCuda(cudaPeekAtLastError(), "CUDA attention softmax launch");
+        checkCublas(
+            cublasGemmStridedBatchedEx(
+                handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                static_cast<int>(dv), static_cast<int>(seqlen),
+                static_cast<int>(total_len), &alpha,
+                repeated_value, data_type, static_cast<int>(dv),
+                static_cast<long long>(total_len * dv),
+                probabilities, data_type, static_cast<int>(total_len),
+                static_cast<long long>(seqlen * total_len),
+                &beta, head_output, data_type, static_cast<int>(dv),
+                static_cast<long long>(seqlen * dv),
+                static_cast<int>(nhead), CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            "cublasGemmStridedBatchedEx attention PV");
+        llaisys_cuda_attention_head_to_token_kernel<<<
+            blocks(count), BLOCK, 0, stream>>>(
+            reinterpret_cast<T *>(out), head_output, seqlen, nhead, dv);
+        checkCuda(cudaPeekAtLastError(), "CUDA attention transpose launch");
+        checkCublas(cublasDestroy(handle), "cublasDestroy attention");
+        handle = nullptr;
+        checkCuda(cudaFreeAsync(workspace, stream),
+                  "cudaFreeAsync attention workspace");
+    } catch (...) {
+        if (handle != nullptr) cublasDestroy(handle);
+        if (workspace != nullptr) cudaFreeAsync(workspace, stream);
+        throw;
+    }
 }
 
 #define DISPATCH_FLOAT_TYPES(call) \
