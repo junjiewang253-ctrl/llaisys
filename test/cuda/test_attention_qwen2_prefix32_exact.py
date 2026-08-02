@@ -52,7 +52,8 @@ def main():
             [message], tokenize=True, add_generation_prompt=True
         )
     )[:32]
-    os.environ["LLAISYS_QWEN2_TRACE_LAYER"] = "3"
+    diagnostic_layer = int(os.environ.get("LLAISYS_M6B_ATTENTION_LAYER", "3"))
+    os.environ["LLAISYS_QWEN2_TRACE_LAYER"] = str(diagnostic_layer)
     model = llaisys.Qwen2(str(model_dir), device="cuda", dtype="bf16")
     trace = model.forward_trace(tokens)
     query = trace["diagnostic_q_rope"]
@@ -71,7 +72,10 @@ def main():
     delta = (actual.float() - expected.float()).abs()
     count = int(mismatch.sum())
     maximum = float(delta.max())
-    print(f"prefix32_layer3_attention mismatches={count} max_abs={maximum}")
+    print(
+        f"prefix32_layer{diagnostic_layer}_attention "
+        f"mismatches={count} max_abs={maximum}"
+    )
     assert count == 0
     print("QWEN2_PREFIX32_ATTENTION_EXACT_PASS")
 
