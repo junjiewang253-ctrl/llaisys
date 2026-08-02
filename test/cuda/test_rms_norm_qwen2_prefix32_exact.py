@@ -79,11 +79,22 @@ def main():
         (source_float * source_float).mean(-1, keepdim=True) + 1e-6
     )
     expected_mul = (normalized_mul.to(torch.bfloat16) * weight_cuda).cpu()
-    source_ll = llaisys_tensor(source, llaisys.DeviceType.NVIDIA)
-    weight_ll = llaisys_tensor(weight, llaisys.DeviceType.NVIDIA)
+    float_diagnostic = os.environ.get("LLAISYS_M6B_RMS_FLOAT", "") == "1"
+    if float_diagnostic:
+        source_operand = source.float()
+        weight_operand = weight.float()
+        expected = (normalized * weight_cuda.float()).cpu()
+        expected_mul = (normalized_mul * weight_cuda.float()).cpu()
+        output_dtype = llaisys.DataType.F32
+    else:
+        source_operand = source
+        weight_operand = weight
+        output_dtype = llaisys.DataType.BF16
+    source_ll = llaisys_tensor(source_operand, llaisys.DeviceType.NVIDIA)
+    weight_ll = llaisys_tensor(weight_operand, llaisys.DeviceType.NVIDIA)
     output_ll = llaisys.Tensor(
         source.shape,
-        dtype=llaisys.DataType.BF16,
+        dtype=output_dtype,
         device=llaisys.DeviceType.NVIDIA,
         device_id=0,
     )
@@ -99,6 +110,7 @@ def main():
     ).reshape(-1).tolist()
     print(
         f"{prompt_id}_length{len(tokens)}_layer{layer}_{boundary}_rms "
+        f"dtype={'f32' if float_diagnostic else 'bf16'} "
         f"mismatches={mismatches} max_abs={maximum}"
     )
     print(
