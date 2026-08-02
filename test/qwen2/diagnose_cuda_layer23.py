@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
@@ -169,6 +170,15 @@ def main():
             f"model.layers.{layer_id}.post_attention_layernorm.weight",
         ),
     )
+    attn_norm_cuda = trace["diagnostic_attn_norm"].cuda()
+    for projection in ("q", "k", "v"):
+        prefix = f"model.layers.{layer_id}.self_attn.{projection}_proj"
+        split_bias = F.linear(
+            attn_norm_cuda, weights[f"{prefix}.weight"].cuda(), bias=None
+        ) + weights[f"{prefix}.bias"].cuda()
+        result[f"{projection}_split_bias_cuda_formula"] = stats(
+            split_bias.cpu(), captured[projection]
+        )
     print(json.dumps({
         "role": "diagnostic_only",
         "case": f"P3-prefix-{len(tokens)}",
