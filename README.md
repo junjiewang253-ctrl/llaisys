@@ -5,6 +5,45 @@
 <a href="README_ZN.md" target="README_ZN.md">中文</a>
 </p>
 
+## Status of This Fork
+
+This fork contains the history-preserving `integration/m2-m6` development
+line used by the LLAISYS → InfiniLM PerfGuard project. The verified
+implementation baseline is:
+
+```text
+branch: integration/m2-m6
+commit: a56a71ec930a1d063c722e6325c9dbcfbdf72c21
+state:  LOCAL_GATE_PASS / AUDIT_PENDING
+```
+
+The branch preserves the official baseline and the user's earlier fork
+history through an ordinary merge. It implements and validates:
+
+- Runtime, Tensor, ownership, view/stride and C ABI error boundaries;
+- CPU operators and Qwen2 CPU inference;
+- KV cache prefill/decode, reset/reuse and allocation accounting;
+- NVIDIA Runtime and CUDA operators;
+- Qwen2-0.5B CPU/CUDA, cache/no-cache four-way correctness;
+- CUDA memory/race/init/synchronization sanitizers and targeted Nsight traces.
+
+The final immutable M6-B closeout ran 67 commands with 67 true exits equal to
+zero. It used the fixed Apache-2.0 model
+`Qwen/Qwen2-0.5B-Instruct@5d7fcd0489cec614eada4fb067e18a019683b178`.
+Model weights, virtual environments, build products, caches and profiler
+binaries are intentionally not stored in this repository.
+
+This is a correctness result, not a performance or production claim.
+Independent campaign audit is still pending, and multi-GPU/NCCL/TP capacity
+work belongs to the separate control repository:
+[junjiewang253-ctrl/llaisys-infinilm-private](https://github.com/junjiewang253-ctrl/llaisys-infinilm-private).
+
+For continued development, branch from `integration/m2-m6`. Keep the verified
+implementation commit above as the experiment identity; documentation-only
+descendants do not change that identity. The remote `main` branch is retained
+as the pre-campaign fork baseline until the completed campaign is reviewed and
+merged normally.
+
 ## Introduction
 
 LLAISYS (Let's Learn AI SYStem) is an educational project that aims to provide a platform for new and future AI engineers to learn how to build AI systems from scratch. LLAISYS consists of assignments that help students learn and build the basic modules, followed by a project stage in which qualified students contribute to the InfiniLM inference engine. LLAISYS uses C++ as primary programming language for system backend, and is compiled into shared libraries exposing C language APIs. Frontend codes are written in Python which calls these APIs to provide more convenient testing and interaction with other architectures such as PyTorch.
