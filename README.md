@@ -14,7 +14,7 @@ implementation baseline is:
 ```text
 branch: integration/m2-m6
 commit: a56a71ec930a1d063c722e6325c9dbcfbdf72c21
-state:  LOCAL_GATE_PASS / AUDIT_PENDING
+state:  AUDIT_PASS / VALID_WITH_SUPPLEMENT / EVIDENCE_CONTROL_WARN
 ```
 
 The branch preserves the official baseline and the user's earlier fork
@@ -28,21 +28,25 @@ history through an ordinary merge. It implements and validates:
 - CUDA memory/race/init/synchronization sanitizers and targeted Nsight traces.
 
 The final immutable M6-B closeout ran 67 commands with 67 true exits equal to
-zero. It used the fixed Apache-2.0 model
+zero. Independent audit checked the six frozen stage taskbooks, implementation
+and evidence commits, 4,480 manifest entries, model/runtime identities,
+sanitizer/profiler evidence, and the final regression set. Historical evidence
+control deviations remain recorded as warnings; they do not change the scoped
+correctness result. The campaign used the fixed Apache-2.0 model
 `Qwen/Qwen2-0.5B-Instruct@5d7fcd0489cec614eada4fb067e18a019683b178`.
 Model weights, virtual environments, build products, caches and profiler
 binaries are intentionally not stored in this repository.
 
 This is a correctness result, not a performance or production claim.
-Independent campaign audit is still pending, and multi-GPU/NCCL/TP capacity
-work belongs to the separate control repository:
+Multi-GPU/NCCL/TP capacity, the audited M9 four-GPU baseline, the audited M10
+InfiniLM/vLLM comparison, and the next M11 profiling stage belong to the
+separate control repository:
 [junjiewang253-ctrl/llaisys-infinilm-private](https://github.com/junjiewang253-ctrl/llaisys-infinilm-private).
 
-For continued development, branch from `integration/m2-m6`. Keep the verified
-implementation commit above as the experiment identity; documentation-only
-descendants do not change that identity. The remote `main` branch is retained
-as the pre-campaign fork baseline until the completed campaign is reviewed and
-merged normally.
+For continued development, use the existing `integration/m2-m6` line. Keep the
+verified implementation commit above as the experiment identity;
+documentation-only descendants do not change that identity. The remote `main`
+branch remains the pre-campaign fork baseline and is not rewritten.
 
 ## Introduction
 
