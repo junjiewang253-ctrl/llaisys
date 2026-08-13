@@ -13,7 +13,7 @@
 ```text
 分支：integration/m2-m6
 提交：a56a71ec930a1d063c722e6325c9dbcfbdf72c21
-状态：LOCAL_GATE_PASS / AUDIT_PENDING
+状态：AUDIT_PASS / VALID_WITH_SUPPLEMENT / EVIDENCE_CONTROL_WARN
 ```
 
 该分支通过普通 merge 保留了官方基线和用户早期 fork 历史，已实现并验证：
@@ -26,17 +26,21 @@
 - CUDA 内存、竞态、初始化、同步 sanitizer 和定向 Nsight trace。
 
 M6-B 最终不可变收尾共执行 67 条命令，67 条 true exit 全部为 0。
-正确性模型固定为 Apache-2.0 的
+独立审计已核对 6 份冻结 taskbook、实现与证据 commit、4,480 个 manifest
+条目、模型/运行时身份、sanitizer/profiler 证据和最终回归。历史证据控制
+偏差继续作为 WARN 保留，不改变限定范围内的 correctness 结论。正确性模型固定为
+Apache-2.0 的
 `Qwen/Qwen2-0.5B-Instruct@5d7fcd0489cec614eada4fb067e18a019683b178`。
 模型权重、虚拟环境、构建产物、缓存和 profiler 二进制不进入本仓库。
 
-这是正确性本地门结果，不是性能或生产环境结论。当前仍等待独立
-campaign audit，多卡/NCCL/TP 和容量实验属于独立的项目控制仓库：
+这是正确性结果，不是性能或生产环境结论。多卡/NCCL/TP 容量、已审计的
+M9 四卡基线、已审计的 M10 InfiniLM/vLLM 对照和下一阶段 M11 profiling
+属于独立的项目控制仓库：
 [junjiewang253-ctrl/llaisys-infinilm-private](https://github.com/junjiewang253-ctrl/llaisys-infinilm-private)。
 
-后续开发应从 `integration/m2-m6` 新建分支。上述 `a56a71e` 始终作为本次
-correctness 实验身份；其后的纯文档提交不改变该身份。远端 `main` 保留为
-campaign 前的 fork 基线，等独立审计后再通过普通 PR/merge 合入。
+后续开发继续使用已有 `integration/m2-m6` 开发线。上述 `a56a71e` 始终作为
+本次 correctness 实验身份；其后的纯文档提交不改变该身份。远端 `main`
+保留为 campaign 前的 fork 基线，不改写历史。
 
 ## 简介
 
