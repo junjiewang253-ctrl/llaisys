@@ -39,9 +39,16 @@ binaries are intentionally not stored in this repository.
 
 This is a correctness result, not a performance or production claim.
 Multi-GPU/NCCL/TP capacity, the audited M9 four-GPU baseline, the audited M10
-InfiniLM/vLLM comparison, and the next M11 profiling stage belong to the
-separate control repository:
+InfiniLM/vLLM comparison, the M11 diagnosis, the M12 CUDA Graph repair, and
+the upstream InfiniLM PR belong to the separate control repository:
 [junjiewang253-ctrl/llaisys-infinilm-private](https://github.com/junjiewang253-ctrl/llaisys-infinilm-private).
+
+The downstream project is locally complete through M13. Its final InfiniLM
+candidate passed TP1/TP2/TP4 Graph OFF/ON correctness (6/6 cells, 72/72
+token-exact) and is under upstream review in
+[InfiniTensor/InfiniLM#540](https://github.com/InfiniTensor/InfiniLM/pull/540).
+That PR is not merged and its CI still requires upstream action; these facts
+do not change this repository's audited LLAISYS implementation identity.
 
 For continued development, use the existing `integration/m2-m6` line. Keep the
 verified implementation commit above as the experiment identity;

@@ -34,9 +34,15 @@ Apache-2.0 的
 模型权重、虚拟环境、构建产物、缓存和 profiler 二进制不进入本仓库。
 
 这是正确性结果，不是性能或生产环境结论。多卡/NCCL/TP 容量、已审计的
-M9 四卡基线、已审计的 M10 InfiniLM/vLLM 对照和下一阶段 M11 profiling
-属于独立的项目控制仓库：
+M9 四卡基线、已审计的 M10 InfiniLM/vLLM 对照、M11 诊断、M12 CUDA Graph
+修复和 InfiniLM 上游 PR 属于独立的项目控制仓库：
 [junjiewang253-ctrl/llaisys-infinilm-private](https://github.com/junjiewang253-ctrl/llaisys-infinilm-private)。
+
+下游项目本地工程主线已完成到 M13。最终 InfiniLM 候选通过 TP1/TP2/TP4 ×
+Graph OFF/ON 6/6 cells、72/72 token-exact，并已提交
+[InfiniTensor/InfiniLM#540](https://github.com/InfiniTensor/InfiniLM/pull/540)
+等待上游评审。该 PR 尚未合并，CI 仍需上游操作；这些外部状态不改变本仓库
+LLAISYS 已审计的实现身份。
 
 后续开发继续使用已有 `integration/m2-m6` 开发线。上述 `a56a71e` 始终作为
 本次 correctness 实验身份；其后的纯文档提交不改变该身份。远端 `main`
